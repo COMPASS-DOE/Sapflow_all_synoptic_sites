@@ -22,6 +22,10 @@ library(ggplot2)
 library(ggpubr)
 library(lubridate)
 
+###TODOs
+#add detail about what values are useful for what
+#incorporate an example of filtering using the companion abiotic data
+
 ```
 
 # Sapflow Data Processing
