@@ -1,6 +1,6 @@
 ---
 title: "sapflow_processing"
-author: "Kendalynn A. Morris"
+author: "Roberta Peixoto modified from Kendalynn A. Morris"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -21,72 +21,11 @@ library(dplyr)
 library(ggplot2)
 library(ggpubr)
 library(lubridate)
+library(arrow)
 
-###TODOs
-#add detail about what values are useful for what
-#incorporate an example of filtering using the companion abiotic data
 
 ```
 
-# Sapflow Data Processing
-
-
-
-#### If Needed, Get Data
-
-
-
-```{r Data, cache=TRUE, cache.lazy=FALSE}
-#Don't have any sapflow data? You go get it child!
-
-# For sapflow, soil VWC, & EC: doi:10.15485/2479200
-# For Tair & PAR: doi:10.15485/2439400
-
-# Files need to be unzipped for processing here!
-
-#TEMPEST data from 2024
-site <- "TMP"
-pat <- paste0("^", site, ".*csv$")
-variables <- c("sapflow_2.5cm", "soil_vwc_15cm", "soil_EC_15cm")
-
-#Lists all the files
-files_T24 <- list.files("TMP_2024/", pattern = pat, recursive = TRUE, full.names = TRUE)
-
-f <- function(f) {
-  message("Reading ", basename(f))
-  x <- read_csv(f, col_types = "ccTccccdccii")
-  x[x$research_name %in% variables,]
-}
-
-#Bind together all files 
-dat <- lapply(files_T24,  f)
-tmp_full<- do.call("rbind", dat)
-
-#saveRDS(tmp_full, "tmp_2024.rds")
-#tmp_full <- readRDS("tmp_2024.rds")
-
-#GCREW data from 2024
-#Note: vappress is all 0 for now until we get that sorted out
-#Update: vappress doesn't exist in the ESS-DIVE level 1 data
-site <- "GCW"
-pat <- paste0("^", site, ".*csv$")
-variables <- c("wx_tempavg15", "wx_par_den15")
-
-#List files
-files_G24 <- list.files("GCW_2024/", pattern = pat, recursive = TRUE, full.names = TRUE)
-
-#Bind together all files 
-dat <- lapply(files_G24,  f)
-gcw_full <- do.call("rbind", dat)
-
-#saveRDS(gcw_full, "gcw_full.rds")
-#gcw_full <- readRDS("gcw_full.rds")
-
-rm(dat)
-
-#tree id data, .RDS lives in this repo
-tree_dat <- readRDS("inventory.rds")
-```
 
 ## Sapflow Sensor Data  
 
@@ -94,121 +33,109 @@ A quick look at raw TEMPEST 2024 sap flow data distribution across plots / speci
 
 ```{r A Little Tidying}
 
+#reading L2 dataset
+synoptic_full <- readRDS("synoptic_full.rds")
+
+#tree id data, .RDS lives in this repo
+tree_dat <- readRDS("dbh.rds")
+
 # Species names
 tree_dat %>%
-  mutate(Species = substr(spp,1,4),
-         Species = case_when(spp == "ACRU" ~ "Red Maple",
-                             spp == "LITU" ~ "Tulip Poplar",
-                             spp == "FAGR" ~ "Beech")) %>%
-  dplyr::select(Plot, Sapflux_ID, Species) -> species
+  mutate(Species = substr(Species ,1,6),
+         Species = case_when(Species  == "ACRU" ~ "Red Maple",
+                             Species  == "CALA21" ~ "Carya laciniosa",
+                             Species  == "CAOV2" ~ "Carya ovata",
+                             Species  == "PITA" ~ "Pinus taeda",
+                             Species  == "QUAL" ~ "Quercus alba L.",
+                             Species  == "QUBI" ~ "Quercus bicolor")) %>%
+  dplyr::select(Plot, Site, Sapflux_ID, Species) -> species
 
-#Isolate sapflow data, filter Out Of Bounds and Out Of Service
-tmp_full %>% 
-  filter(Instrument == "Sapflow",
-         F_OOB == 0,
-         F_OOS == 0) %>%
-  dplyr::select(Plot, TIMESTAMP, Sensor_ID, Value) %>%
-  mutate(sapflow_2.5cm = Value, #Value is the difference in mV between the two probes
-         Date = date(TIMESTAMP),
-         Plot = substr(Plot,1,1),
-         Plot = case_when(Plot == "C" ~ "Control",
-                          Plot == "F" ~ "Freshwater",
-                          Plot == "S" ~ "Saltwater", )) %>%
-  merge(species, ., by.x = c("Sapflux_ID", "Plot"), by.y = c("Sensor_ID", "Plot"),
-        all.x = TRUE, all.y = TRUE) %>% #Merge with species names
-  mutate(ID = Sapflux_ID) %>%
-  select(-Value, -ID) -> sapflow
+#merging sap flow with sp names
+synoptic_full%>% 
+  merge(species, ., by.x = c("Sapflux_ID", "Plot"), by.y = c("Sensor_ID", "Plot"), all.x = TRUE, all.y = TRUE) -> sapflow
 
 sapflow %>%
-  group_by(Plot, Species) %>%
+  group_by(Plot, Site, Species) %>%
   summarize(tree_ids = length(unique(Sapflux_ID)),
     data_rows = n()) -> sapflow_summary
 
 sf_raw <- sapflow_summary
 print(sf_raw)
-sf_hist <- hist(sapflow$sapflow_2.5cm)
+sf_hist <- hist(sapflow$sapflow_3.5cm)
 
 ```
-
-
-### Companion Data
-
- Soil electrical conductivity (EC) and volumetric water content, as well as air temperature (T_air) and photosynthetically active radiation (par),  
- pending: Vapor pressure deficit (VPD)  
-
-```{r Additional Tidying, cache=TRUE, cache.lazy=FALSE}
-
-#Soil Data from TEMPEST plots
-soil_data <- tmp_full %>%
-  filter(Instrument != "Sapflow") %>%
-  mutate(Plot = substr(Plot,1,1),
-         Plot = case_when(Plot == "C" ~ "Control",
-                          Plot == "F" ~ "Freshwater",
-                          Plot == "S" ~ "Saltwater"),
-         Measure = case_when(
-           research_name == "soil_vwc_15cm" ~ "soil_vwc",
-           research_name == "soil_EC_15cm" ~ "soil_ec")) %>%
-  filter(F_OOB == 0,
-         F_OOS == 0) %>%
-  dplyr::select(Plot, Location, TIMESTAMP, Measure, Value) %>%
-  tidyr::pivot_wider(names_from = Measure, values_from = Value,
-                     values_fn = ~ mean(.x, na.rm = TRUE)) #better ways to do this?
-
-soil_data %>%
-  ggplot(aes(x = soil_ec)) + 
-  geom_histogram(fill = "lightblue", color = "black") +
-  labs(title = "EC") -> ec
-
-soil_data %>%
-  ggplot(aes(x = soil_vwc)) + 
-  geom_histogram(fill = "lightpink", color = "black") +
-  labs(title = "VWC") -> vwc
-
-#Atmospheric data from GCREW sensors
-atmo_data <- gcw_full %>%
-  mutate(Measure = case_when(
-    research_name == "wx_par_den15" ~ "PAR",
-    research_name == "wx_tempavg15" ~ "TEMP")) %>%
-  filter(!is.na(Measure),
-         Measure > 0) %>% #F_OOB and F_OOS not fully populated for this dataset
-  dplyr::select(TIMESTAMP, Value, Measure) %>%
-  tidyr::pivot_wider(names_from = Measure, values_from = Value)
-
-atmo_data %>%
-  ggplot(aes(x = PAR)) + 
-  geom_histogram(fill = "violet", color = "black") +
-  labs(title = "PAR") -> par
-
-atmo_data %>%
-  ggplot(aes(x = TEMP)) + 
-  geom_histogram(fill = "orange", color = "black") +
-  labs(title = "T_air") -> tair
-
-ggarrange(ec, vwc, par, tair, ncol = 2)
-
-```
-
 ## Calculations  
-
-
 
 ### Maximum Temperature Difference (dTmax)  
 
 The dTmax calculation determines the maximum difference in probe temperatures during the early morning hours (ie., zero to very low flow). Sap flow data is pre-processed as the difference in voltage between probes, all we have to do is find the maximum value. Here we opt for the largest 15 minute average between the hours of midnight and 5 am.  
+Updates here: dTmax will be based a larger time interval and not including cloud days
 
 ```{r Convert Voltage to Flux}
 
-#Calculate dTmax
-sapflow %>% 
-  mutate(Date = date(TIMESTAMP),
-         Hour = hour(TIMESTAMP)) %>%
-  filter(Hour >= 0, Hour <= 5) %>%
-  group_by(Date, Plot, Species, Sapflux_ID) %>% 
-  summarise(dTmax = max(sapflow_2.5cm, na.rm = TRUE), 
-            dTmax_time = TIMESTAMP[which.max(sapflow_2.5cm)]) -> sapflow_dtmax
+#Filtering data for the ideal condition to Calculate dTmax
+sapflow_dtmax <- sapflow %>%
+  mutate(DATE = as.Date(TIMESTAMP),hour = hour(TIMESTAMP)) %>%
+  dplyre::select(TIMESTAMP, DATE, hour, Site, Plot, Sensor_ID,`sapflow-3.5cm` ) %>%
+  filter(hour >= 0 & hour <= 4,        # night
+        `sapflow-3.5cm` > 0.2 ) %>%    # bad data - maybe low V ???
+  arrange(Sensor_ID, TIMESTAMP)
+
+#calculating night dTmax
+sap_night_max <- sapflow_dtmax  %>%
+  group_by(Sensor_ID, Site, Plot) %>%  
+  arrange(DATE, .by_group = TRUE) %>%
+  # Here is the update from 3-12-2026 for dTmax calculation RBP
+  # moving window for dTmax: max value in a 15 days window
+  mutate(dTmax_14d = slide_dbl(`sapflow-3.5cm`,
+                               ~ max(.x, na.rm = TRUE),
+                               .before = 7,
+                               .after  = 7),
+         sd_14d = slide_dbl(dTmax_14d, 
+                            ~ sd(.x, na.rm = TRUE),
+                            .before = 7,
+                            .after  = 7)) %>%
+                    ungroup()
+
+# Adaptive dTmax logic: maintain the previous dTmax until the new value exceeds ±2 SD of the previous day
+sap_daily_max <- sap_night_max  %>%
+  group_by(Sensor_ID, Site, Plot) %>%
+  arrange(DATE, .by_group = TRUE) %>%
+  mutate(
+    dTmax_final = accumulate(
+      dTmax_14d,       # sliding 14-day dTmax values
+      ~ {
+        prev <- .x     # previous dTmax_final
+        curr <- .y     # current dTmax_14d
+        # If there is no previous value (first day), initialize with the current value
+        if(is.null(prev)) return(curr)
+        # If both previous and current are not NA, apply the ±2 SD rule
+        if(!is.na(prev) & !is.na(curr)) {
+          # If current is within ±2 SD of the previous day, keep the previous dTmax_final
+          if(curr <= (prev + 2 * sd_14d) & curr >= (prev - 2 * sd_14d)) {
+            return(prev)
+          } else {
+            # If it exceeds ±2 SD, update to the current dTmax_14d
+            return(curr)
+          }
+        } else {
+          # If any value is NA, use the current value
+          return(curr)
+        }
+      }
+    )
+  ) %>%
+  ungroup()
+
+# Assign the daily dTmax_final to all 15-minute observations
+sapflow_final <- sapflow %>%
+  left_join(
+    sap_daily_max %>% select(Sensor_ID, Site, Plot, DATE, dTmax_final),
+    by = c("Sensor_ID", "Site", "Plot", "DATE")
+  )
 
 
-sapflow_dtmax %>%
+sap_night_max%>%
   mutate(hour = hour(dTmax_time)) %>% # Convert to hour for plotting
   ggplot(aes(x = hour)) + 
   geom_histogram(binwidth = 1, fill = "darkblue", color = "black") +
