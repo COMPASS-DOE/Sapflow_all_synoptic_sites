@@ -11,9 +11,9 @@
 .Rapp.history
 
 # Data files
-*.RDS
-.RData
-.RDataTmp
+#*.RDS
+#.RData
+#.RDataTmp
 
 # User-specific files
 .Ruserdata
