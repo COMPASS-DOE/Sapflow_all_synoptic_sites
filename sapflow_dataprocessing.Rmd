@@ -22,6 +22,7 @@ library(ggplot2)
 library(ggpubr)
 library(lubridate)
 library(arrow)
+library(slider)
 
 
 ```
@@ -29,13 +30,15 @@ library(arrow)
 
 ## Sapflow Sensor Data  
 
-A quick look at raw TEMPEST 2024 sap flow data distribution across plots / species and voltage difference values.  
+A quick look at raw Synoptic sap flow data distribution across plots / Sites / species and voltage difference values.  
 
 ```{r A Little Tidying}
 
 #reading L2 dataset
-synoptic_full <- readRDS("synoptic_full.rds")
+#synoptic_full <- readRDS("C:/Users/rbitten/Downloads/synoptic_full.rds")
+synoptic_full <- readRDS("C:/Users/rbitten/Downloads/synoptic_full_sap_only.rds")
 
+  
 #tree id data, .RDS lives in this repo
 tree_dat <- readRDS("dbh.rds")
 
@@ -48,20 +51,20 @@ tree_dat %>%
                              Species  == "PITA" ~ "Pinus taeda",
                              Species  == "QUAL" ~ "Quercus alba L.",
                              Species  == "QUBI" ~ "Quercus bicolor")) %>%
-  dplyr::select(Plot, Site, Sapflux_ID, Species) -> species
+  dplyr::select(Plot, Site, Sensor_ID, Species) -> species
 
 #merging sap flow with sp names
 synoptic_full%>% 
-  merge(species, ., by.x = c("Sapflux_ID", "Plot"), by.y = c("Sensor_ID", "Plot"), all.x = TRUE, all.y = TRUE) -> sapflow
+  merge(species, ., by=c("Sensor_ID", "Site", "Plot"), all = TRUE) -> sapflow
 
 sapflow %>%
   group_by(Plot, Site, Species) %>%
-  summarize(tree_ids = length(unique(Sapflux_ID)),
+  summarize(tree_ids = length(unique(Sensor_ID)),
     data_rows = n()) -> sapflow_summary
 
 sf_raw <- sapflow_summary
 print(sf_raw)
-sf_hist <- hist(sapflow$sapflow_3.5cm)
+sf_hist <- hist(sapflow$'sapflow-3.5cm')
 
 ```
 ## Calculations  
@@ -76,15 +79,19 @@ Updates here: dTmax will be based a larger time interval and not including cloud
 #Filtering data for the ideal condition to Calculate dTmax
 sapflow_dtmax <- sapflow %>%
   mutate(DATE = as.Date(TIMESTAMP),hour = hour(TIMESTAMP)) %>%
-  dplyre::select(TIMESTAMP, DATE, hour, Site, Plot, Sensor_ID,`sapflow-3.5cm` ) %>%
+  dplyr::select(TIMESTAMP, DATE, hour, Site, Plot, Sensor_ID,`sapflow-3.5cm` ) %>%
   filter(hour >= 0 & hour <= 4,        # night
-        `sapflow-3.5cm` > 0.2 ) %>%    # bad data - maybe low V ???
+        "sapflow-3.5cm" > 0.2 ,        # bad data - maybe low V ???
+        "wx-par-den15" > 200          # night
+                                       # TODO: include here the vpd filter
+        ) %>%    
   arrange(Sensor_ID, TIMESTAMP)
 
 #calculating night dTmax
 sap_night_max <- sapflow_dtmax  %>%
   group_by(Sensor_ID, Site, Plot) %>%  
   arrange(DATE, .by_group = TRUE) %>%
+  
   # Here is the update from 3-12-2026 for dTmax calculation RBP
   # moving window for dTmax: max value in a 15 days window
   mutate(dTmax_14d = slide_dbl(`sapflow-3.5cm`,
