@@ -35,8 +35,9 @@ A quick look at raw Synoptic sap flow data distribution across plots / Sites / s
 ```{r A Little Tidying}
 
 #reading L2 dataset
-#synoptic_full <- readRDS("C:/Users/rbitten/Downloads/synoptic_full.rds")
-synoptic_full <- readRDS("C:/Users/rbitten/Downloads/synoptic_full_sap_only.rds")
+synoptic_full <- readRDS("synoptic_full_sap_clima.rds")
+synoptic_full <- readRDS("LE_full_sap_clima.rds")
+#synoptic_full <- readRDS("C:/Users/rbitten/Downloads/synoptic_full_sap_only.rds")
 
   
 #tree id data, .RDS lives in this repo
@@ -66,6 +67,7 @@ sf_raw <- sapflow_summary
 print(sf_raw)
 sf_hist <- hist(sapflow$'sapflow-3.5cm')
 
+
 ```
 ## Calculations  
 
@@ -76,63 +78,153 @@ Updates here: dTmax will be based a larger time interval and not including cloud
 
 ```{r Convert Voltage to Flux}
 
-#Filtering data for the ideal condition to Calculate dTmax
-sapflow_dtmax <- sapflow %>%
-  mutate(DATE = as.Date(TIMESTAMP),hour = hour(TIMESTAMP)) %>%
-  dplyr::select(TIMESTAMP, DATE, hour, Site, Plot, Sensor_ID,`sapflow-3.5cm` ) %>%
-  filter(hour >= 0 & hour <= 4,        # night
-        "sapflow-3.5cm" > 0.2 ,        # bad data - maybe low V ???
-        "wx-par-den15" > 200          # night
-                                       # TODO: include here the vpd filter
-        ) %>%    
-  arrange(Sensor_ID, TIMESTAMP)
+library(dplyr)
+library(lubridate)
+library(slider)
+library(purrr)
 
-#calculating night dTmax
-sap_night_max <- sapflow_dtmax  %>%
-  group_by(Sensor_ID, Site, Plot) %>%  
-  arrange(DATE, .by_group = TRUE) %>%
+# =========================
+# CONFIGURATION
+# =========================
+window_days <- 7      # window of days to calculate mean and SD
+cv_thresh <- 0.1      # delta-T stability threshold
+vpd_thresh <- 0.05    # VPD threshold for flag
+par_thresh <- 200     # PAR threshold for flag
+
+# =========================
+# STEP 1 — NIGHT + STABLE dT
+# =========================
+sapflow_prep <- sapflow %>%
+  mutate(DATE = as.Date(TIMESTAMP),
+         hour = hour(TIMESTAMP)) %>%
+  filter(hour >= 23 | hour <= 4,
+         !is.na(`sapflow-3.5cm`)) %>%
   
-  # Here is the update from 3-12-2026 for dTmax calculation RBP
-  # moving window for dTmax: max value in a 15 days window
-  mutate(dTmax_14d = slide_dbl(`sapflow-3.5cm`,
-                               ~ max(.x, na.rm = TRUE),
-                               .before = 7,
-                               .after  = 7),
-         sd_14d = slide_dbl(dTmax_14d, 
-                            ~ sd(.x, na.rm = TRUE),
-                            .before = 7,
-                            .after  = 7)) %>%
-                    ungroup()
-
-# Adaptive dTmax logic: maintain the previous dTmax until the new value exceeds ±2 SD of the previous day
-sap_daily_max <- sap_night_max  %>%
+  # group by tree
   group_by(Sensor_ID, Site, Plot) %>%
-  arrange(DATE, .by_group = TRUE) %>%
+  arrange(TIMESTAMP) %>%
+  
+  # calculate delta-T stability (coefficient of variation)
   mutate(
-    dTmax_final = accumulate(
-      dTmax_14d,       # sliding 14-day dTmax values
+    cv_2h = slide_dbl(
+      `sapflow-3.5cm`,
       ~ {
-        prev <- .x     # previous dTmax_final
-        curr <- .y     # current dTmax_14d
-        # If there is no previous value (first day), initialize with the current value
-        if(is.null(prev)) return(curr)
-        # If both previous and current are not NA, apply the ±2 SD rule
-        if(!is.na(prev) & !is.na(curr)) {
-          # If current is within ±2 SD of the previous day, keep the previous dTmax_final
-          if(curr <= (prev + 2 * sd_14d) & curr >= (prev - 2 * sd_14d)) {
-            return(prev)
-          } else {
-            # If it exceeds ±2 SD, update to the current dTmax_14d
-            return(curr)
-          }
-        } else {
-          # If any value is NA, use the current value
-          return(curr)
-        }
+        if(all(is.na(.x))) return(NA_real_)
+        m <- mean(.x, na.rm = TRUE)
+        s <- sd(.x, na.rm = TRUE)
+        if(is.na(m) || m == 0) return(NA_real_)
+        s / m
+      },
+      .before = 7,
+      .complete = FALSE
+    ),
+    stable_2h = ifelse(!is.na(cv_2h) & cv_2h < cv_thresh, TRUE, FALSE)
+  ) %>%
+  
+  # 7-day windowed flags (before/after)
+  mutate(
+    valid_PAR = ifelse(!is.na(`wx-par-den15`) & `wx-par-den15` < par_thresh, TRUE, FALSE),
+    
+    # VPD: mean and SD over 7-day window (currently commented out)
+    # vpd_mean = slide_dbl(VPD,
+    #                      ~mean(.x, na.rm=TRUE),
+    #                      .before=window_days*24, .after=window_days*24, .complete=TRUE),
+    # vpd_sd   = slide_dbl(VPD,
+    #                      ~sd(.x, na.rm=TRUE),
+    #                      .before=window_days*24, .after=window_days*24, .complete=TRUE),
+    # valid_VPD = ifelse(!is.na(vpd_mean) & !is.na(vpd_sd),
+    #                    abs(VPD - vpd_mean) <= 2*vpd_sd, FALSE),
+    
+    valid_dt = stable_2h) %>%
+  ungroup()
+
+# =========================
+# STEP 2 — WINDOWED PAR & VPD FLAGS (recalculate)
+# =========================
+sapflow_prep <- sapflow_prep %>%
+  group_by(Sensor_ID, Site, Plot) %>%
+  arrange(DATE) %>%
+  mutate(
+    # PAR: mean and SD over 7-day window
+    par_mean = slide_dbl(`wx-par-den15`, 
+                         ~mean(.x, na.rm=TRUE), 
+                         .before=window_days*24, .after=window_days*24, .complete=FALSE),
+    par_sd = slide_dbl(`wx-par-den15`, 
+                       ~sd(.x, na.rm=TRUE), 
+                       .before=window_days*24, .after=window_days*24, .complete=FALSE),
+    valid_PAR = ifelse(!is.na(par_mean) & !is.na(par_sd),
+                       abs(`wx-par-den15` - par_mean) <= par_sd, FALSE),
+    
+    # VPD: mean and SD over 7-day window (commented for now)
+    # vpd_mean = slide_dbl(VPD, 
+    #                      ~mean(.x, na.rm=TRUE), 
+    #                      .before=window_days*24, .after=window_days*24, .complete=TRUE),
+    # vpd_sd = slide_dbl(VPD, 
+    #                    ~sd(.x, na.rm=TRUE), 
+    #                    .before=window_days*24, .after=window_days*24, .complete=TRUE),
+    # valid_VPD = ifelse(!is.na(vpd_mean) & !is.na(vpd_sd),
+    #                    abs(VPD - vpd_mean) <= 2*vpd_sd, FALSE),
+    
+    valid_dt = stable_2h
+  ) %>%
+  ungroup() %>%
+  select(-par_mean, -par_sd) #-vpd_mean, -vpd_sd)
+
+# =========================
+# STEP 3 — dTmax_final: use last valid if PAR/VPD outside threshold
+# =========================
+sapflow_prep <- sapflow_prep %>%
+  group_by(Sensor_ID, Site, Plot, DATE) %>%
+  arrange(TIMESTAMP) %>%
+  mutate(
+    dTmax_roll = `sapflow-3.5cm`, # replace if you have daily delta-T calculated
+    # carry forward last valid dTmax if criteria fail
+    dTmax_final = accumulate2(
+      dTmax_roll, valid_PAR  & valid_dt, # & valid_VPD 
+      .init = NA_real_,
+      function(prev, curr, valid){
+        if(is.na(curr)) return(prev)
+        if(!valid) return(prev)
+        return(curr)
       }
-    )
+    )[-1] %>% unlist()
   ) %>%
   ungroup()
+
+# =========================
+# STEP 4 — FINAL ACCEPTANCE FLAG
+# =========================
+sapflow_prep <- sapflow_prep %>%
+  mutate(
+    accepted = ifelse(!is.na(dTmax_final), "YES", "NO")
+  )
+
+# =========================
+# FINAL OUTPUT
+# =========================
+str(sapflow_prep)
+table(sapflow_prep$valid_dt, useNA="ifany")
+table(sapflow_prep$valid_PAR, useNA="ifany")
+# table(sapflow_prep$valid_VPD, useNA="ifany")
+table(sapflow_prep$accepted, useNA="ifany")
+
+# =========================
+# STEP 8 — JOIN BACK
+# =========================
+
+sapflow_final <- sapflow %>%
+  mutate(DATE = as.Date(TIMESTAMP)) %>%
+  left_join(
+    sap_daily %>%
+      select(Sensor_ID, Site, Plot, DATE, dTmax_final, accepted),
+    by = c("Sensor_ID", "Site", "Plot", "DATE")
+  )
+
+sapflow_prep%>%
+  ggplot(aes(x = hour)) + 
+  geom_histogram(binwidth = 1, fill = "darkblue", color = "black") +
+  labs(title = "Histogram of Hour for dTmax", x = "Hour", y = "Frequency") +
+  theme_minimal()
 
 # Assign the daily dTmax_final to all 15-minute observations
 sapflow_final <- sapflow %>%
@@ -140,20 +232,6 @@ sapflow_final <- sapflow %>%
     sap_daily_max %>% select(Sensor_ID, Site, Plot, DATE, dTmax_final),
     by = c("Sensor_ID", "Site", "Plot", "DATE")
   )
-
-
-sap_night_max%>%
-  mutate(hour = hour(dTmax_time)) %>% # Convert to hour for plotting
-  ggplot(aes(x = hour)) + 
-  geom_histogram(binwidth = 1, fill = "darkblue", color = "black") +
-  labs(title = "Histogram of Hour for dTmax", x = "Hour", y = "Frequency") +
-  theme_minimal()
-
-sapflow_dtmax %>%
-  ggplot(aes(x = dTmax)) + 
-  geom_histogram(fill = "darkgreen", color = "black") +
-  labs(title = "Histogram of dTmax Values", x = "Value", y = "Frequency") +
-  theme_minimal()
 
 #Calculate Flux
 
