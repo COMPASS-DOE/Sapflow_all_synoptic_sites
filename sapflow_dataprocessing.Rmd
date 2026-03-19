@@ -35,13 +35,12 @@ A quick look at raw Synoptic sap flow data distribution across plots / Sites / s
 ```{r A Little Tidying}
 
 #reading L2 dataset
-synoptic_full <- readRDS("synoptic_full_sap_clima.rds")
-synoptic_full <- readRDS("LE_full_sap_clima.rds")
-#synoptic_full <- readRDS("C:/Users/rbitten/Downloads/synoptic_full_sap_only.rds")
-
+#removing deep sensors for now and formating Sensor ID to merge later with tree sp
+synoptic_full <- readRDS("synoptic_full_sap_clima.rds")%>%filter(Plot!="W",!Sensor_ID %in% c("01D", "02D", "03D", "04D", "05D", "06D", "07D", "08D")) %>% dplyr::select(-'sapflow-5cm') %>% mutate(Sensor_ID = str_pad(as.character(Sensor_ID), width = 2, pad = "0"))
   
-#tree id data, .RDS lives in this repo
-tree_dat <- readRDS("dbh.rds")
+#tree id data, .RDS lives in this repo , formating Sensor_Id to merge with sapflow data later
+tree_dat <- readRDS("dbh.rds") %>%
+  mutate(Sensor_ID = str_pad(as.character(Sensor_ID), width = 2, pad = "0"))
 
 # Species names
 tree_dat %>%
@@ -126,14 +125,14 @@ sapflow_prep <- sapflow %>%
     valid_PAR = ifelse(!is.na(`wx-par-den15`) & `wx-par-den15` < par_thresh, TRUE, FALSE),
     
     # VPD: mean and SD over 7-day window (currently commented out)
-    # vpd_mean = slide_dbl(VPD,
-    #                      ~mean(.x, na.rm=TRUE),
-    #                      .before=window_days*24, .after=window_days*24, .complete=TRUE),
-    # vpd_sd   = slide_dbl(VPD,
-    #                      ~sd(.x, na.rm=TRUE),
-    #                      .before=window_days*24, .after=window_days*24, .complete=TRUE),
-    # valid_VPD = ifelse(!is.na(vpd_mean) & !is.na(vpd_sd),
-    #                    abs(VPD - vpd_mean) <= 2*vpd_sd, FALSE),
+    vpd_mean = slide_dbl(vpd,
+                         ~mean(.x, na.rm=TRUE),
+                         .before=window_days*24, .after=window_days*24, .complete=TRUE),
+    vpd_sd   = slide_dbl(vpd,
+                         ~sd(.x, na.rm=TRUE),
+                         .before=window_days*24, .after=window_days*24, .complete=TRUE),
+    valid_VPD = ifelse(!is.na(vpd_mean) & !is.na(vpd_sd),
+                       abs(vpd - vpd_mean) <= 2*vpd_sd, FALSE),
     
     valid_dt = stable_2h) %>%
   ungroup()
@@ -155,20 +154,20 @@ sapflow_prep <- sapflow_prep %>%
     valid_PAR = ifelse(!is.na(par_mean) & !is.na(par_sd),
                        abs(`wx-par-den15` - par_mean) <= par_sd, FALSE),
     
-    # VPD: mean and SD over 7-day window (commented for now)
-    # vpd_mean = slide_dbl(VPD, 
-    #                      ~mean(.x, na.rm=TRUE), 
-    #                      .before=window_days*24, .after=window_days*24, .complete=TRUE),
-    # vpd_sd = slide_dbl(VPD, 
-    #                    ~sd(.x, na.rm=TRUE), 
-    #                    .before=window_days*24, .after=window_days*24, .complete=TRUE),
-    # valid_VPD = ifelse(!is.na(vpd_mean) & !is.na(vpd_sd),
-    #                    abs(VPD - vpd_mean) <= 2*vpd_sd, FALSE),
+     #VPD: mean and SD over 7-day window (commented for now)
+     vpd_mean = slide_dbl(vpd, 
+                          ~mean(.x, na.rm=TRUE), 
+                          .before=window_days*24, .after=window_days*24, .complete=TRUE),
+     vpd_sd = slide_dbl(vpd, 
+                        ~sd(.x, na.rm=TRUE), 
+                        .before=window_days*24, .after=window_days*24, .complete=TRUE),
+     valid_VPD = ifelse(!is.na(vpd_mean) & !is.na(vpd_sd),
+                        abs(vpd - vpd_mean) <= 2*vpd_sd, FALSE),
     
     valid_dt = stable_2h
   ) %>%
   ungroup() %>%
-  select(-par_mean, -par_sd) #-vpd_mean, -vpd_sd)
+  select(-par_mean, -par_sd,-vpd_mean, -vpd_sd)
 
 # =========================
 # STEP 3 — dTmax_final: use last valid if PAR/VPD outside threshold
