@@ -12,7 +12,7 @@ output:
 
 ```{r setup, include=FALSE}
 
-knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
 
 library(readr)
 library(stringr)
@@ -28,7 +28,7 @@ library(slider)
 ```
 
 
-## Sapflow Sensor Data  
+## get Sapflow Sensor Data  
 
 A quick look at raw Synoptic sap flow data distribution across plots / Sites / species and voltage difference values.  
 
@@ -36,7 +36,9 @@ A quick look at raw Synoptic sap flow data distribution across plots / Sites / s
 
 #reading L2 dataset
 #removing deep sensors for now and formatting Sensor ID to merge later with tree sp
-synoptic_full <- readRDS("synoptic_full_sap_clima.rds")%>%filter(Plot!="W",!Sensor_ID %in% c("01D", "02D", "03D", "04D", "05D", "06D", "07D", "08D")) %>% dplyr::select(-'sapflow-5cm') %>% mutate(Sensor_ID = str_pad(as.character(Sensor_ID), width = 2, pad = "0"))
+synoptic_full <-  read.csv("sap_temp_rh.csv") #readRDS("synoptic_full_sap_clima.rds")
+                 
+synoptic_full <- synoptic_full %>%filter(Plot!="W",!Sensor_ID %in% c("01D", "02D", "03D", "04D", "05D", "06D", "07D", "08D")) %>% dplyr::select(-'sapflow.5cm') %>% mutate(Sensor_ID = str_pad(as.character(Sensor_ID), width = 2, pad = "0"))
   
 #tree id data, .RDS lives in this repo , formatting Sensor_Id to merge with sap flow data later
 tree_dat <- readRDS("dbh.rds") %>%
@@ -57,85 +59,619 @@ tree_dat %>%
 synoptic_full%>% 
   merge(species, ., by=c("Sensor_ID", "Site", "Plot"), all = TRUE) -> sapflow_df
 
-sapflow %>%
+#removing days we were not checking sensors in the field anymore
+DATE_START <- as.Date("2022-01-01")
+DATE_END   <- as.Date("2025-12-31")
+
+sapflow_df <- sapflow_df %>%
+  filter(as.Date(TIMESTAMP) >= DATE_START, as.Date(TIMESTAMP) <= DATE_END)
+
+sapflow_df %>%
   group_by(Plot, Site, Species) %>%
   summarize(tree_ids = length(unique(Sensor_ID)),
     data_rows = n()) -> sapflow_summary
 
+
 sf_raw <- sapflow_summary
 print(sf_raw)
-sf_hist <- hist(sapflow$'sapflow-3.5cm')
+sf_hist <- hist(sapflow_df$'sapflow.3.5cm')
 
 
 ```
+
+####filter bad days
+We use the technician notes to remove data from days when they identify problems in the sensors or/power
+
+```{r}
+
+# 1- Reading issue csv
+bad_intervals <- read.csv("sapflow_daily_issues.csv") %>% # We need to update this for CRC and CB sites
+  # TIMESTAMP as POSIXct
+  mutate(E_TIME   = trimws(gsub(" PM| AM", "", E_TIME)),
+    S_TIME   = trimws(gsub(" PM| AM", "", S_TIME)),
+    start_dt = as.POSIXct(paste(S_DATE, S_TIME), format = "%m/%d/%Y %H:%M:%S", tz = "UTC"),
+    end_dt   = as.POSIXct(paste(END,    E_TIME),  format = "%m/%d/%Y %H:%M:%S", tz = "UTC")
+  )
+
+# 2- expanding lines with  alert for multiple ports
+bad_expanded <- bad_intervals %>%
+                mutate(PORT = strsplit(as.character(PORT), ",\\s*")) %>%
+                unnest(PORT) %>%
+                mutate(PORT = trimws(PORT))
+
+# 3- reading alert for all ports
+bad_all      <- bad_expanded %>% filter(PORT == "ALL")
+bad_specific <- bad_expanded %>% filter(PORT != "ALL")%>%
+                                mutate(PORT = str_pad(PORT, width = 2, pad = "0"))
+
+# 4- helper to replace data for NAN in the issued time interval
+apply_bad_mask <- function(df, bad_all, bad_specific) {
+  
+  df <- df %>% mutate(row_id = row_number())
+  
+  # ALL: applied for all Sensor_ID of the respective Site+Plot
+  rows_all <- bad_all %>%
+    inner_join(df %>% select(row_id, Site, Plot, TIMESTAMP),
+               by = c("SITE" = "Site", "PLOT" = "Plot"),
+               relationship = "many-to-many") %>%
+    filter(TIMESTAMP >= start_dt & TIMESTAMP <= end_dt) %>%
+    pull(row_id)
+  
+  # specific ports: applied only for one Sensor_ID 
+  rows_specific <- bad_specific %>%
+        inner_join(df %>% select(row_id, Site, Plot, Sensor_ID, TIMESTAMP),
+               by = c("SITE" = "Site", "PLOT" = "Plot", "PORT" = "Sensor_ID"),
+               relationship = "many-to-many") %>%
+    filter(TIMESTAMP >= start_dt & TIMESTAMP <= end_dt) %>%
+    pull(row_id)
+  
+  # combining and introducing NA
+  bad_rows <- unique(c(rows_all, rows_specific))
+  
+  df %>%
+    mutate(sapflow.3.5cm = if_else(row_id %in% bad_rows, NA_real_, sapflow.3.5cm)) %>%
+    select(-row_id)
+}
+
+# 5-applied field sensor issues QAQC
+sf_data_clean <- apply_bad_mask(sapflow_df, bad_all, bad_specific)
+
+# 6- printing how many reading were marked
+cat("lines with NA before filtering  - sapflow NA before:", sum(is.na(sapflow_df$sapflow.3.5cm)), "\n")
+cat("lines with NA after filtering  - sapflow NA after:", sum(is.na(sf_data_clean$sapflow.3.5cm)), "\n")
+cat("New NAs applied:", 
+    sum(is.na(sf_data_clean$sapflow.3.5cm)) - sum(is.na(sapflow_df$sapflow.3.5cm)), "\n")
+
+# comparing % of bad days per Site/Plot
+bind_rows(
+  sapflow_df %>% 
+    group_by(Site, Plot) %>% 
+    summarise(pct_na = round(100 * sum(is.na(sapflow.3.5cm)) / n(), 1), .groups = "drop") %>%
+    mutate(version = "before"),
+  sf_data_clean %>% 
+    group_by(Site, Plot) %>% 
+    summarise(pct_na = round(100 * sum(is.na(sapflow.3.5cm)) / n(), 1), .groups = "drop") %>%
+    mutate(version = "after")
+) %>%
+  pivot_wider(names_from = version, values_from = pct_na) %>%
+  mutate(delta = after - before) %>%
+  arrange(Site, Plot)
+```
+
 ## Calculations  
 
 ### Maximum Temperature Difference (dTmax)  
 
-The dTmax calculation determines the maximum difference in probe temperatures during the early morning hours (ie., zero to very low flow). Sap flow data is pre-processed as the difference in voltage between probes, all we have to do is find the maximum value. Here we opt for the largest 15 minute average between the hours of midnight and 5 am.  
-Updates here: dTmax will be based a larger time interval and not including cloud days
+The dTmax calculation determines the maximum difference in probe temperatures during the early morning hours (ie., zero to very low flow). Sap flow data is pre-processed as the difference in voltage between probes, all we have to do is find the maximum value. Here we opt for the largest 15 minute average between the hours of midnight and 5 am (not anymore).  
 
-```{r Convert Voltage to Flux}
+Updates by Roberta Peixoto in 7/2/2026: dTmax will be calculated based on the same environmental criterias used in baseliner software to remove noise and bad sensor values
 
-# night:        filter(Hour >= 23, Hour <= 4)
-# Low PAR:      filter (PAR < 200)
-# Low VPD:      filter (VPD < 0.2)
-# VPD stability:  4 points <2SD from what??
+- night period = from 11pm to 4am
+- low VPD = VPD < 0.2 kPa
+- raw sapflow (mV) stability???? nighttime spike detection via Z-score (computed within each night, 
+  Site x Plot x Sensor x day_of_night)- low variation for mV within Z-score spike detection on nighttime sapflow observations Method: Z-score calculated within each night (Site x Plot x Sensor x day_of_night) With ~20 obs/night, Zmax = 19/sqrt(20) = 4.25, making |Z| > 2.5 feasible.Threshold selected based on sensitivity analysis across thresholds 1.5-3.0.
+-only accept dTmax with low variability withing a moving window of 14 days
 
-library(dplyr)
-library(tidyr)
-library(zoo)
-library(ggplot2)
+** Is the night period too long here? Should I evaluate mV stability in a 2 hour period (???) - Are we having too much influence of outliers on zscore if we set up 2h (only 8 datapoint?) Should we remove these flagged obs for raw sapflow stability from the Js/F calculation?
 
-WINDOW_WIDTH <- 14 * 24 * 4 # 14 days times 24 hours per day times 4 obs per hours (15min interval)
-sapflow_df$VPD_rollmean <- zoo::rollmean(sapflow_df$`wx-vpd15`, k = 14 * 24 * 4, fill = "extend", na.rm = TRUE)
-sapflow_df$VPD_rollsd <- rollapply(sapflow_df$`wx-vpd15`, width = WINDOW_WIDTH, FUN = sd, partial = TRUE, na.rm = TRUE )
+```{r mV stability investigation}
 
-# extracting day and hour 
-sapflow_df<-sapflow_df%>%
-                 mutate (day = as.Date(TIMESTAMP),
-                         hour=hour(TIMESTAMP))
+# CHUNK 1: Nighttime sapflow spike detection — Z-score method to evaluate raw sapflow stability 
 
-# Compute "day of night" -- 23h-24h should be used for the following day's
-# computation, i.e. grouped with 1h-4h of the next day
-sapflow_df$day_of_night <- if_else(sapflow_df$hour >= 23, sapflow_df$day + 1, sapflow_df$day)
+# PLOT THE ZSCORES PER SENSOR AND EVALUATE HIGH VARIABILITY THAT SHOULD BE REMOVED BUT IS NOT BC OF A HIGH THRESHOLD IN ZSCORE
 
-night_stats<- sapflow_df %>% 
-  filter(hour >= 23 | hour <=4) %>% 
-  group_by(Sensor_ID, day_of_night) %>% 
-  mutate(accept = (!is.na(`wx-par-den15`) & `wx-par-den15` < 200) &
-            (!is.na(`wx-vpd15`)     & `wx-vpd15` < 0.2) &
-            (!is.na(VPD_rollmean)   & !is.na(VPD_rollsd) &
-                # within 2 standard deviations of 14-day mean
-                (`wx-vpd15` - VPD_rollmean) < 2 * VPD_rollsd),
-        dTmax = if_else(
-            any(accept, na.rm = TRUE),                          # is there any accepted line?
-            max(`sapflow-3.5cm`[accept == TRUE], na.rm = TRUE), # max only in the accepted lines
-            NA_real_                                            # otherwise NA (not -Inf)
-        )
+
+# Z-score calculated within each night (Site x Plot x Sensor x day_of_night)
+# With ~20 obs/night, Zmax = 19/sqrt(20) = 4.25, making |Z| > 2.5 feasible.
+# Threshold selected based on sensitivity analysis across thresholds 1.5-3.0:
+#   |Z| > 1.5 removed 11.78% -- too aggressive, likely removing natural variation
+#   |Z| > 1.8 removed  8.23% -- still aggressive???   <----- maybe we want to remove a lot of bad sensors obs??  revisit here
+#   |Z| > 2.0 removed  5.55% -- consistent with 2SD but still high
+#   |Z| > 2.2 removed  1.68% -- conservative start point
+#   |Z| > 2.5 removed  0.48% -- only clear outliers   <-- SELECTED too soft??? 
+#   |Z| > 3.0 removed  0.12% -- only extreme spikes
+
+# TO DISCUSS WITH BEN: current spike filter compares each point to the
+# whole night's mean/SD (Z-score, ~20 obs/night). This catches isolated
+# spikes well, but a night with diffuse high-frequency noise (no single
+# point far from the night's own mean/SD, but neighboring points
+# disagreeing a lot with each other) could pass through undetected,
+# since the night's SD absorbs that noise. Consider switching to (or
+# adding) a local 2-hour rolling stability check instead/in addition,
+# to catch this case and avoid letting an entire noisy night through
+# uncaught before the 14-day dTmax stability filter downstream.
+
+ZSCORE_THRESHOLD   <- 2.5  # |Z|  -- spike threshold (selected from sensitivity analysis)
+
+# ── 1a. compute nightly Z-scores ──────────────────────────────────────────────
+sf_data_clean <- sf_data_clean %>%
+  mutate(
+    day          = as.Date(TIMESTAMP),
+    hour         = hour(TIMESTAMP),
+    day_of_night = if_else(hour >= 23, day + 1, day),
+    is_night     = hour >= 23 | hour <= 4
+  ) %>%
+  arrange(Site, Plot, Sensor_ID, TIMESTAMP) %>%
+  group_by(Site, Plot, Sensor_ID, day_of_night) %>%
+  mutate(
+    # mean and SD computed within each night only (daytime obs excluded)
+    sap_night_mean = if_else(is_night,
+                             mean(sapflow.3.5cm[is_night], na.rm = TRUE),
+                             NA_real_),
+    sap_night_sd   = if_else(is_night,
+                             sd(sapflow.3.5cm[is_night],   na.rm = TRUE),
+                             NA_real_),
+    sap_zscore     = (sapflow.3.5cm - sap_night_mean) / sap_night_sd
+  ) %>%
+  ungroup()
+
+# ── 1b. threshold sensitivity analysis ────────────────────────────────────────
+threshold_sensitivity <- data.frame(
+  threshold = c(1.5, 1.8, 2.0, 2.2, 2.5, 3.0)
+) %>%
+  mutate(
+    n_spikes  = sapply(threshold, function(t)
+      sum(sf_data_clean$is_night & !is.na(sf_data_clean$sap_zscore) &
+          abs(sf_data_clean$sap_zscore) > t, na.rm = TRUE)),
+    pct_night = sapply(threshold, function(t)
+      round(100 * sum(sf_data_clean$is_night & !is.na(sf_data_clean$sap_zscore) &
+                      abs(sf_data_clean$sap_zscore) > t, na.rm = TRUE) /
+                  sum(sf_data_clean$is_night, na.rm = TRUE), 2))
+  )
+
+cat("=== Threshold sensitivity analysis ===\n")
+print(threshold_sensitivity)
+cat("\nSelected threshold:", ZSCORE_THRESHOLD, "->",
+    threshold_sensitivity$pct_night[threshold_sensitivity$threshold == ZSCORE_THRESHOLD],
+    "% of night obs flagged as spikes\n")
+
+# ── 1c. apply selected threshold ──────────────────────────────────────────────
+sf_data_clean <- sf_data_clean %>%
+  mutate(flag_spike = is_night & !is.na(sap_zscore) &
+                      abs(sap_zscore) > ZSCORE_THRESHOLD)
+
+# ── 1d. diagnostics ───────────────────────────────────────────────────────────
+cat("\n=== Spike detection summary (|Z| >", ZSCORE_THRESHOLD, ") ===\n")
+cat("Night obs total :", sum(sf_data_clean$is_night,   na.rm = TRUE), "\n")
+cat("Spikes detected :", sum(sf_data_clean$flag_spike, na.rm = TRUE), "\n")
+cat("Pct of night obs:",
+    round(100 * sum(sf_data_clean$flag_spike, na.rm = TRUE) /
+                sum(sf_data_clean$is_night,   na.rm = TRUE), 2), "%\n")
+
+cat("\nZ-score quantiles (night obs only):\n")
+print(quantile(abs(sf_data_clean$sap_zscore[sf_data_clean$is_night]),
+               probs = c(0.90, 0.95, 0.99, 0.999), na.rm = TRUE))
+
+cat("\nSpikes by Site/Plot:\n")
+
+sf_data_clean %>%
+  filter(is_night) %>%
+  group_by(Site, Plot) %>%
+  summarise(n_night   = n(),
+            n_spike   = sum(flag_spike, na.rm = TRUE),
+            pct_spike = round(100 * n_spike / n_night, 2),
+            .groups   = "drop") %>%
+  print(n = Inf)
+
+# ── 1e. validation plots ───────────────────────────────────────────────────────
+# find sensor/month with most spikes in GCW TR (highest spike rate)
+sf_data_clean <- sf_data_clean %>%
+  mutate(TIMESTAMP = as.POSIXct(TIMESTAMP, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+
+spike_meta <- sf_data_clean %>%
+  filter(Site == "GCW", Plot == "TR", is_night) %>%
+  mutate(
+    TIMESTAMP_dt = as.POSIXct(TIMESTAMP, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    Year_Month = floor_date(TIMESTAMP_dt, "month")
+  ) %>%
+  group_by(Sensor_ID, Year_Month) %>%
+  summarise(n_spike = sum(flag_spike, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(n_spike)) %>%
+  slice(1)
+
+cat("\nValidation plot: GCW TR | Sensor:", spike_meta$Sensor_ID,
+    "| Month:", format(spike_meta$Year_Month, "%B %Y"),
+    "| Spikes:", spike_meta$n_spike, "\n")
+
+plot_dat <- sf_data_clean %>%
+   filter(Site      == "GCW",
+         Plot      == "TR",
+         Sensor_ID == spike_meta$Sensor_ID,
+         is_night,
+         floor_date(TIMESTAMP, "month") == spike_meta$Year_Month) %>%
+  mutate(Status = if_else(flag_spike, "Spike", "Normal"))
+
+# Panel A: full month time series
+p1 <- ggplot(plot_dat, aes(x = TIMESTAMP, y = sapflow.3.5cm)) +
+  geom_line(color = "grey60", linewidth = 0.4) +
+  geom_point(aes(color = Status, size = Status), alpha = 0.8) +
+  scale_color_manual(values = c("Normal" = "black", "Spike" = "red")) +
+  scale_size_manual(values  = c("Normal" = 0.8,     "Spike" = 2.5)) +
+  labs(x        = NULL,
+       y        = "Sapflow voltage difference (mV)",
+       color    = NULL, size = NULL,
+       title    = paste0("GCW Transition Zone | Sensor ", spike_meta$Sensor_ID,
+                         " | ", format(spike_meta$Year_Month, "%B %Y")),
+       subtitle = paste0("Nighttime observations (11 pm – 4 am) | ",
+                         "Red = spike flagged by Z-score > ", ZSCORE_THRESHOLD)) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+# Panel B: Z-score distribution
+p2 <- plot_dat %>%
+  filter(!is.na(sap_zscore)) %>%
+  ggplot(aes(x = abs(sap_zscore), fill = Status)) +
+  geom_histogram(bins = 30, color = "white", linewidth = 0.2) +
+  geom_vline(xintercept = ZSCORE_THRESHOLD,
+             color = "red", linetype = "dashed", linewidth = 0.9) +
+  annotate("text", x = ZSCORE_THRESHOLD + 0.05, y = Inf,
+           label = paste("|Z| =", ZSCORE_THRESHOLD),
+           hjust = 0, vjust = 1.8, color = "red", size = 3.5) +
+  scale_fill_manual(values = c("Normal" = "grey50", "Spike" = "red")) +
+  labs(x = "|Z-score|", y = "Count", fill = NULL,
+       title    = "Nightly Z-score distribution",
+       subtitle = "Dashed line = selected spike threshold") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+# Panel 1: time series + distribution
+(p1 / p2) +
+  plot_layout(heights = c(2, 1)) +
+  plot_annotation(
+    title   = "Spike detection validation — Z-score method",
+    caption = paste0("Threshold |Z| > ", ZSCORE_THRESHOLD,
+                     " selected from sensitivity analysis (0.48% of night obs flagged)."),
+    theme   = theme(plot.title   = element_text(size = 14, face = "bold"),
+                    plot.caption = element_text(size = 9, color = "grey40"))
+  )
+
+# Panel 2: per-night detail
+plot_dat %>%
+  mutate(night_label = format(day_of_night, "%b %d")) %>%
+  ggplot(aes(x = TIMESTAMP, y = sapflow.3.5cm)) +
+  geom_line(color = "grey60", linewidth = 0.4) +
+  geom_point(aes(color = Status, size = Status), alpha = 0.8) +
+  scale_color_manual(values = c("Normal" = "black", "Spike" = "red")) +
+  scale_size_manual(values  = c("Normal" = 0.8,     "Spike" = 2.5)) +
+  facet_wrap(~night_label, scales = "free_x", ncol = 5) +
+  labs(x = NULL, y = "Sapflow (mV)", color = NULL, size = NULL,
+       title    = "Per-night spike detection — GCW Transition Zone",
+       subtitle = paste0("Each panel = one night | dTmax computed from black points only",
+                         " | Red = spike (|Z| > ", ZSCORE_THRESHOLD, ")"),
+       caption  = "Observations flagged as spikes are excluded from dTmax computation.") +
+  theme_bw(base_size = 10) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        axis.text.x      = element_blank(),
+        axis.ticks.x     = element_blank(),
+        plot.title       = element_text(size = 13, face = "bold"),
+        plot.caption     = element_text(size = 9,  color = "grey40"))
+```
+
+#dTmax calc
+```{r calculating dTmax}
+
+#  Night criteria flags, dTmax calculation and stability filter
+#
+# Criteria applied hierarchically within each night (day_of_night):
+#   1. missing_sapflow : sapflow.3.5cm is NA -> excluded
+#   2. high_vpd        : VPD >= 0.2 kPa      -> excluded
+#   3. spike_zscore    : |Z| > 2.5            -> excluded (from CHUNK 1)
+#   4. accepted        : passed all criteria  -> used for dTmax
+#
+# dTmax = max sapflow (mV) among accepted observations each night
+# dTmax stability: nights with dTmax > 2SD from 14-day rolling mean are removed
+# Fill: after removing unstable dTmax, remaining gaps filled downup
+
+# ── STEP 1: apply night criteria and compute dTmax ────────────────────────────
+
+# Compute VPD using Remko's package - better coverage than using the weather station vpd that had problems in the first years
+library(plantecophys)
+
+cat("VPD summary (confirm range 0-4 kPa plausible):\n")
+print(summary(sf_data_clean$vpd))
+cat("N VPD NA:", sum(is.na(sf_data_clean$vpd)), "\n")
+
+# MSM NA's removed
+sf_data_clean <- sf_data_clean %>%
+  filter(Site != "", Plot != "", !is.na(Sensor_ID))
+
+#defining our thresholds
+VPD_THRESHOLD      <- 0.2   # kPa -- matches documented "low VPD = VPD < 0.2 kPa"
+WINDOW_WIDTH_DTMAX <- 14    # days -- matches documented "14-day rolling mean"
+
+# Defensive: ensure flag_spike exists, even if this chunk is run standalone
+# without "mV stability investigation" having run first in the same session.
+# Recomputes the same nightly Z-score spike flag defined there.
+
+if (!"flag_spike" %in% names(sf_data_clean)) {
+  cat("flag_spike not found -- recomputing nightly Z-score spike flag here.\n")
+
+  ZSCORE_THRESHOLD <- 2.5   # must match the threshold selected in the
+                             # sensitivity analysis (mV stability investigation)
+sf_data_clean <- sf_data_clean %>%
+    mutate(
+      day          = as.Date(TIMESTAMP),
+      hour         = hour(TIMESTAMP),
+      day_of_night = if_else(hour >= 23, day + 1, day),
+      is_night     = hour >= 23 | hour <= 4
     ) %>%
+    arrange(Site, Plot, Sensor_ID, TIMESTAMP) %>%
+    group_by(Site, Plot, Sensor_ID, day_of_night) %>%
+    mutate(
+      sap_night_mean = if_else(is_night, mean(sapflow.3.5cm[is_night], na.rm = TRUE), NA_real_),
+      sap_night_sd   = if_else(is_night, sd(sapflow.3.5cm[is_night],   na.rm = TRUE), NA_real_),
+      sap_zscore     = (sapflow.3.5cm - sap_night_mean) / sap_night_sd,
+      flag_spike     = is_night & !is.na(sap_zscore) & abs(sap_zscore) > ZSCORE_THRESHOLD
+    ) %>%
+    ungroup()
+}
+
+night_stats <- sf_data_clean %>%
+  filter(is_night) %>%
+  group_by(Site, Plot, day_of_night, Sensor_ID) %>%
+  mutate(
+    # dTmax NOT matching baseline: max of all night obs regardless of criteria
+    dTmaxDaily = {
+      v <- sapflow.3.5cm[!is.na(sapflow.3.5cm)]
+      if (length(v) > 0) max(v) else NA_real_
+    },
+
+    # individual rejection flags
+    flag_na_sap = is.na(sapflow.3.5cm),
+    flag_vpd    = is.na(vpd) | vpd >= VPD_THRESHOLD,
+    
+    # flag_spike: computed in CHUNK 1 via nightly Z-score
+    # rejection reason (hierarchical: first failing criterion wins)
+    reject_reason = case_when(
+      flag_na_sap ~ "missing_sapflow",
+      flag_vpd    ~ "high_vpd",
+      flag_spike  ~ "spike_zscore",
+      TRUE        ~ "accepted"
+    ),
+
+    accept = reject_reason == "accepted",
+
+    # dTmax: max sapflow among accepted obs this night only
+    dTmax = if_else(
+      any(accept, na.rm = TRUE),
+      suppressWarnings(max(sapflow.3.5cm[accept], na.rm = TRUE)),
+      NA_real_)
+  ) %>%
+  ungroup()
+
+# diagnostic: rejection summary by Site/Plot
+cat("=== Night observation rejection summary ===\n")
+night_stats %>%
+  group_by(Site, Plot, reject_reason) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Site, Plot) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  pivot_wider(names_from  = reject_reason,
+              values_from = c(n, pct),
+              values_fill = 0) %>%
+  print(n = Inf)
+
+# ── STEP 2: dTmax stability filter (14-day rolling mean/sd) ───────────────────
+dtmax_daily <- night_stats %>%
+  distinct(Site, Plot, Sensor_ID, day_of_night, dTmax) %>%
+  arrange(Site, Plot, Sensor_ID, day_of_night) %>%
+  group_by(Site, Plot, Sensor_ID) %>%
+  mutate(
+    # 14-day rolling mean and sd of nightly dTmax
+    dTmax_rollmean = slider::slide_dbl(dTmax,
+                                       ~mean(.x, na.rm = TRUE),
+                                       .before = WINDOW_WIDTH_DTMAX %/% 2,
+                                       .after  = WINDOW_WIDTH_DTMAX %/% 2,
+                                       .complete = FALSE),
+    dTmax_rollsd   = slider::slide_dbl(dTmax,
+                                       ~sd(.x, na.rm = TRUE),
+                                       .before = WINDOW_WIDTH_DTMAX %/% 2,
+                                       .after  = WINDOW_WIDTH_DTMAX %/% 2,
+                                       .complete = FALSE),
+
+    # stable: dTmax within 2SD of 14-day rolling mean
+    dTmax_stable = !is.na(dTmax_rollmean) & !is.na(dTmax_rollsd) &
+                   abs(dTmax - dTmax_rollmean) <= 2 * dTmax_rollsd,
+
+    # rejection reason at daily level
+    dTmax_reject_reason = case_when(
+      is.na(dTmax)  ~ "no_accepted_night_obs",
+      !dTmax_stable ~ "dTmax_unstable_14day",
+      TRUE          ~ "accepted"
+    ),
+
+    # set unstable dTmax to NA BEFORE fill
+    # only accepted and stable dTmax values propagate forward/backward
+    dTmax_filtered = if_else(dTmax_reject_reason == "accepted",
+                             dTmax, NA_real_)
+  ) %>%
+  # fill gaps using nearest accepted stable dTmax (downup)
+  tidyr::fill(dTmax_filtered, .direction = "downup") %>%
+  rename(dTmax_final = dTmax_filtered) %>%
+  ungroup()
+
+# diagnostic: dTmax stability summary by Site/Plot
+cat("\n=== dTmax stability filter summary ===\n")
+dtmax_daily %>%
+  group_by(Site, Plot, dTmax_reject_reason) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Site, Plot) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  pivot_wider(names_from  = dTmax_reject_reason,
+              values_from = c(n, pct),
+              values_fill = 0) %>%
+  print(n = Inf)
+
+# ── STEP 3: join dTmax_final back to night_stats ──────────────────────────────
+night_stats <- night_stats %>%
+  left_join(
+    dtmax_daily %>% select(Site, Plot, Sensor_ID, day_of_night,
+                           dTmax_rollmean, dTmax_rollsd,
+                           dTmax_stable, dTmax_reject_reason, dTmax_final),
+    by = c("Site", "Plot", "Sensor_ID", "day_of_night")
+  )
+
+# ── STEP 4: overall summary ───────────────────────────────────────────────────
+cat("\n=== Final dTmax coverage after fill ===\n")
+night_stats %>%
+  distinct(Site, Plot, Sensor_ID, day_of_night, dTmax_final) %>%
+  group_by(Site, Plot) %>%
+  summarise(
+    n_nights      = n(),
+    n_with_dtmax  = sum(!is.na(dTmax_final)),
+    pct_coverage  = round(100 * n_with_dtmax / n_nights, 1),
+    .groups       = "drop"
+  ) %>%
+  print(n = Inf)
+
+
+
+################################################################
+###########################################################
+
+# VISUALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHUNK 3: Visualization of QAQC results and dTmax values
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Plot 1: stacked bar of accepted vs rejected obs by rejection reason ────────
+night_stats %>%
+  group_by(Site, Plot, reject_reason) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Site, Plot) %>%
+  mutate(
+    pct          = 100 * n / sum(n),
+    reject_reason = factor(reject_reason,
+                           levels = c("accepted", "high_vpd",
+                                      "spike_zscore", "missing_sapflow"))
+  ) %>%
   ungroup() %>%
-  # Now fill the NAs (values fill down until next non-NA value)
-          tidyr::fill(dTmax, .direction = "downup")
+  mutate(Plot = factor(Plot, levels = c("UP", "TR", "SWAMP"))) %>%
+  ggplot(aes(x = Plot, y = pct, fill = reject_reason)) +
+  geom_col(position = "stack", width = 0.7) +
+  geom_text(aes(label = if_else(pct > 3, paste0(round(pct, 1), "%"), "")),
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  facet_wrap(~Site, ncol = 4) +
+  scale_fill_manual(
+    values = c("accepted"         = "#2E7D32",
+               "high_vpd"         = "#1565C0",
+               "spike_zscore"     = "#F57F17",
+               "missing_sapflow"  = "#C62828"),
+    labels = c("accepted"         = "Accepted",
+               "high_vpd"         = "High VPD (>= 0.2 kPa)",
+               "spike_zscore"     = "Spike (|Z| > 2.5)",
+               "missing_sapflow"  = "Missing sapflow")) +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(title    = "Nighttime observation rejection summary by site and zone",
+       subtitle = "Criteria applied hierarchically: missing data > high VPD > spike detection",
+       x        = "Zone",
+       y        = "% of nighttime observations",
+       fill     = "Rejection reason") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text      = element_text(face = "bold"),
+        panel.grid.minor = element_blank())
 
-#Calculate Flux
+# ── Plot 2: dTmax (criteria-filtered) vs dTmaxDaily (no filter) ───────────────
+library(ggpmisc)
 
-# convert the probe raw values (in mV) to sap flux (cm3/cm2/s)
-# Granier equation is F = (k * (deltaTmax - deltaT))^1.231
-# k = 119 x 10^-4
+night_stats %>%
+  filter(!is.na(dTmax), !is.na(dTmaxDaily)) %>%
+  ggplot(aes(x = dTmax, y = dTmaxDaily)) +
+  geom_point(alpha = 0.2, size = 0.6, color = "grey40") +
+  geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 0.8) +
+  stat_poly_eq(aes(label = paste(after_stat(rr.label),
+                                 after_stat(p.value.label),
+                                 sep = "~~")),
+               formula = y ~ x, parse = TRUE,
+               size = 2.8, label.x = "left", label.y = "top") +
+  facet_wrap(Site ~ Plot, scales = "free") +
+  labs(x        = "dTmax — filtered (VPD < 0.2 kPa + no spike)",
+       y        = "dTmax — unfiltered (daily max)",
+       title    = "Effect of environmental criteria on dTmax estimation",
+       subtitle = "Red line = linear regression | Points above 1:1 line indicate criteria inflate dTmax") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text       = element_text(face = "bold"))
 
-night_stats %>% 
-  mutate(F = 0.011899 * (((dTmax / `sapflow-3.5cm`) - 1)^1.231)) -> sf_data
+# ── Plot 3: dTmax_final time series by Site/Plot ──────────────────────────────
+dtmax_daily %>%
+  filter(!is.na(dTmax_final), day_of_night>"2022-01-01") %>%
+  mutate(Plot = factor(Plot, levels = c("UP", "TR", "SWAMP"))) %>%
+  ggplot(aes(x = day_of_night, y = dTmax_final, color = Plot)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  geom_smooth(method = "loess", span = 0.15, se = FALSE, linewidth = 0.8) +
+  facet_wrap(~Site, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = c("UP"    = "#A5D6AF",
+                                "TR"    = "#B891C4",
+                                "SWAMP" = "#779ECB")) +
+  labs(x        = NULL,
+       y        = "dTmax (mV)",
+       color    = "Zone",
+       title    = "Final dTmax time series after QAQC and stability filter",
+       subtitle = paste0("dTmax computed from accepted night obs only ",
+                         "(VPD < 0.2 kPa + |Z| <= 2.5) | Unstable values removed ",
+                         "and filled from 14-day window")) +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.text       = element_text(face = "bold"))
 
-sf_values <- sf_data %>%
-  select(`F`) %>%
-  summarize(total = length(`F`),
-            `NA` = sum(is.na(`F`)),
-            high = sum(`F` > 0.005, na.rm = TRUE),
-            remainder = total - sum(`NA`, high),
-            percent_good = signif(remainder/total * 100, digits = 3))
+# ── merge dTmax_final into full dataset ───────────────────────────────────────
+dtmax_lookup <- night_stats %>%
+  distinct(Site, Plot, Sensor_ID, day_of_night, dTmax, dTmaxDaily) %>%
+  left_join(
+    dtmax_daily %>% select(Site, Plot, Sensor_ID, day_of_night, dTmax_final),
+    by = c("Site", "Plot", "Sensor_ID", "day_of_night")
+  )
 
-print(sf_values)
+sf_data_final <- sf_data_clean %>%
+  left_join(dtmax_lookup,
+            by = c("Site", "Plot", "Sensor_ID", "day_of_night"))
+
+# final checks
+cat("Rows in sf_data_clean:", nrow(sf_data_clean), "\n")
+cat("Rows in sf_data_final:", nrow(sf_data_final), "\n")
+cat("Rows should match — difference:", nrow(sf_data_final) - nrow(sf_data_clean), "\n")
+
+cat("\ndTmax_final coverage by Site/Plot:\n")
+sf_data_final %>%
+  group_by(Site, Plot) %>%
+  summarise(
+    n_total       = n(),
+    n_with_dtmax  = sum(!is.na(dTmax_final)),
+    pct_coverage  = round(100 * n_with_dtmax / n_total, 1),
+    .groups       = "drop"
+  ) %>%
+  print(n = Inf)
+
+
+### NOTE CHECK WITH BEN AND STEPH - tehre might be a typo for Plot name in SWH in L2
+   #SWH   SWAMP  841728       832864         98.9
+  # SWH   SWMP       12            0          0  
+
 ```
 
 ### Sapflux Density
@@ -160,33 +696,1014 @@ See Steppe et al., 2010 and related literature for all the gory details. ![See S
  In this example, sap flux density values greater than 0.005 have been filtered out. These outliers are a very small portion of the total data.  
 <br><br>
 
-```{r Plot Sap Flow Data}
 
+```{r}
+#Calculate Flux
+
+# convert the probe raw values (in mV) to sap flux (cm3/cm2/s)
+# Granier equation is F = (k * (deltaTmax - deltaT))^1.231 (cm3/cm2/s)
+# k = 119 x 10^-4 (cm3/cm2/s)
+# 119 * K ^ 1.231 = g m-2 s-1 (g = cm3 => water)
+
+sf_data_final %>% 
+  mutate(F = 0.011899 * (((dTmax / `sapflow.3.5cm`) - 1)^1.231),
+         Fdtdaily = 0.011899 * (((dTmaxDaily  / `sapflow.3.5cm`) - 1)^1.231)) -> sf_data
+
+# 1. Raw 15-min data, deduplicated, temporal cutoff applied, but WITHOUT the
+#    MAD outlier filter -- for anyone who wants to apply a different QC
+#    approach downstream.
+
+#write.csv(sf_data, "sf_data7112026.csv", row.names = FALSE) #all data not filter for MAD QAQC yet 
+
+sf_data <-read.csv("sf_data7112026.csv")
+
+sf_values <- sf_data %>%
+  summarize(
+    total         = length(`F`),
+    `NA`          = sum(is.na(`F`)),
+    highF         = sum(`F` > 0.005, na.rm = TRUE),
+    remainder     = total - sum(`NA`, highF),
+    percent_good  = signif(remainder / total * 100, digits = 3),
+    n_zero        = sum(sapflow.3.5cm == 0,  na.rm = TRUE),
+    n_negative    = sum(sapflow.3.5cm < 0,   na.rm = TRUE),
+    n_inf         = sum(is.infinite(F),      na.rm = TRUE),
+    n_nan         = sum(is.nan(F),           na.rm = TRUE),
+    pct_inf       = round(100 * n_inf / n(), 2),
+    highFdaily    = sum(Fdtdaily > 0.005, na.rm = TRUE),   
+    pct_highF     = round(100 * highF      / total, 2),    
+    pct_highFdaily = round(100 * highFdaily / total, 2)   
+  )
+
+print(sf_values)
+
+#checks for overlap in high values between both calculations
 sf_data %>%
-  filter(`F` < 0.005) %>%
-  ggplot(aes(x = `F`)) + 
-  geom_histogram(fill = "lightgreen", color = "black") +
-  labs(title = "Histogram of Sap Flux Density", x = "Value", y = "Frequency") +
-  theme_minimal()
+  filter(!is.na(`F`), !is.infinite(`F`), !is.nan(`F`),
+         !is.na(Fdtdaily), !is.infinite(Fdtdaily), !is.nan(Fdtdaily)) %>%
+  mutate(
+    high_F      = `F`      > 0.005,
+    high_Fdaily = Fdtdaily > 0.005
+  ) %>%
+  count(high_F, high_Fdaily) %>%
+  mutate(pct = round(100 * n / sum(n), 2)) %>%
+  print()
 
-sf_data %>% 
-  mutate(Hour = hour(TIMESTAMP),
-         Date = date(TIMESTAMP)) %>%
-  filter(Hour >= 11, Hour <= 12) %>% 
-  filter(F <= 0.005) %>%
-  group_by(Plot, Species, Date) %>% 
-  summarise(F_avg = mean(F*3600, na.rm = TRUE)) -> sf_plot_avg # 3600 s per hr
+#checking difference between sapflow calcs
+sf_data_filtered<-sf_data%>%filter(Site %in% c("PTR", "OWC", "CRC"),
+         `F` < 0.005,
+         !is.infinite(`F`), !is.nan(`F`),!is.na(F),
+         !is.infinite(Fdtdaily), !is.nan(Fdtdaily))
 
-#plot hourly midday sapflow
-ggplot(sf_plot_avg) + 
-  geom_point(aes (x = Date, y = F_avg, color = Species)) + 
-  facet_wrap(~Plot, ncol = 1, scales = "fixed") + 
-  labs(y = "cm3 per cm2 per hour", x = "Date",
-       title = "Annual Pattern of Midday \n Sap Flux Density")
-
+ggplot(sf_data_filtered, aes(F, Fdtdaily)) +
+  geom_point(aes(color = Site), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "red", se = TRUE,
+              inherit.aes = TRUE) +
+  stat_poly_eq(aes(label = paste(after_stat(rr.label),
+                                 after_stat(p.value.label),
+                                 sep = "~~")),
+               formula = y ~ x,
+               parse   = TRUE,
+               size    = 3,
+               label.x = "left",
+               label.y = "top") +
+  facet_wrap(~Plot) +
+  labs(x     = "F (dTmax 14-day rolling)",
+       y     = "F (dTmax Daily)",
+       color = "Site",
+       title = "Sap flow: rolling vs daily dTmax by Zone") +
+  theme_bw(base_size = 11)
 ```
 
 
+## SANITY CHECKS ON HIGH VALUES BEFORE WE PROCEED WITH QAQC filters
+
+There are clear bad sensor obs not tracked in the technician issues.csv
+How are we handling these: 
+1o- flag for sapflow3.5cm = 0 (mV raw data can not be zero) 
+2o- check if the obs flagged int he step 1 had F (Js = cm3 m2 s) > 0.005
+
+There are clear very high near zero thresholds e.g. min~0= 0.001 //max~0 > 0.4 in CB sensors
+```{r}
+# =============================================================================
+# QAQC DIAGNOSIS — bad mV vs implausible F
+#
+# Goal: determine whether a near-zero raw sapflow (mV) reading reliably
+# co-occurs with an implausible F value (F > 0.005), across the FULL
+# dataset.
+# This is a read-only investigation -- it computes flags for REVIEW only
+# and does not modify sf_data. The production filter is applied in the
+# next chunk, using whichever threshold/logic this investigation confirms
+# is appropriate.
+#
+# Two candidate flagging rules are compared:
+#   - "any single dip": a day is flagged if EVEN ONE 15-min interval has
+#     near-zero mV. Too aggressive with sparse data -- one noisy reading
+#     can flag an otherwise-good day.
+#   - "majority of day": a day is flagged only if most of its observed
+#     intervals are near-zero (MIN_PCT_NEAR_ZERO). More conservative,
+#     protects genuine low-flow days from being discarded.
+# =============================================================================
+
+sf_data <- sf_data %>% mutate(day = as.Date(day))
+
+# ── Step 1: per-tree near-zero threshold (1st percentile of positive mV) ───
+# Sensors never hit exactly 0 (confirmed on PTR) -- they drift near zero,
+# so a per-tree proximity threshold is used instead of exact equality.
+# Grouped by Site x Plot x Sensor_ID (not Sensor_ID alone), since
+# Sensor_ID repeats across sites/plots and is not a unique tree ID.
+near_zero_thresholds <- sf_data %>%
+  filter(sapflow.3.5cm > 0) %>%
+  group_by(Site, Plot, Sensor_ID) %>%
+  summarise(near_zero_threshold = quantile(sapflow.3.5cm, 0.01, na.rm = TRUE), .groups = "drop")
+
+cat("N trees with a near-zero threshold computed:", nrow(near_zero_thresholds), "\n")
+cat("Threshold summary across trees:\n")
+print(summary(near_zero_thresholds$near_zero_threshold))
+
+ggplot(near_zero_thresholds, aes(x = near_zero_threshold)) +
+  geom_histogram(bins = 40, fill = "#2a78d6") +
+  labs(x = "Per-tree near-zero threshold (mV)", y = "N trees",
+       title = "Distribution of per-tree near-zero thresholds",
+       subtitle = "Bimodal split suggests some trees have naturally low baseline signal") +
+  theme_bw()
+
+# ── Step 2: is the low-threshold group explained by species (real biology,
+# e.g. conifers with naturally lower/steadier sap flow) rather than noise? ──
+low_threshold_trees <- near_zero_thresholds %>%
+  filter(near_zero_threshold < 0.05) %>%
+  left_join(sf_data %>% distinct(Site, Plot, Sensor_ID, Species), by = c("Site", "Plot", "Sensor_ID"))
+
+cat("\nSpecies/Site breakdown of LOW-threshold trees (near_zero_threshold < 0.05):\n")
+print(as.data.frame(low_threshold_trees %>% count(Site, Plot, Species, sort = TRUE)))
+
+# ── Step 3: compare "any single dip" vs "majority of day" flagging logic ──
+MIN_PCT_NEAR_ZERO <- 0.5   # fraction of the day's intervals that must be near-zero
+
+day_flags_any <- sf_data %>%
+  left_join(near_zero_thresholds, by = c("Site", "Plot", "Sensor_ID")) %>%
+  filter(!is.na(F), is.finite(F)) %>%
+  group_by(Site, Plot, Sensor_ID, day) %>%
+  summarise(
+    flag_zero_mV = any(sapflow.3.5cm <= near_zero_threshold, na.rm = TRUE),
+    flag_high_F  = any(F > 0.005, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(flag_bad_mV = flag_zero_mV & flag_high_F)
+
+day_flags_majority <- sf_data %>%
+  left_join(near_zero_thresholds, by = c("Site", "Plot", "Sensor_ID")) %>%
+  filter(!is.na(F), is.finite(F)) %>%
+  group_by(Site, Plot, Sensor_ID, day) %>%
+  summarise(
+    n_obs         = n(),
+    n_near_zero   = sum(sapflow.3.5cm <= near_zero_threshold, na.rm = TRUE),
+    pct_near_zero = n_near_zero / n_obs,
+    flag_zero_mV  = pct_near_zero >= MIN_PCT_NEAR_ZERO,
+    flag_high_F   = any(F > 0.005, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(flag_bad_mV = flag_zero_mV & flag_high_F)
+
+cat("\n=== Comparison: 'any single dip' vs 'majority of day' (>= ",
+    MIN_PCT_NEAR_ZERO * 100, "%) ===\n", sep = "")
+cat("'any single dip'  -- sensor-days flagged:", sum(day_flags_any$flag_bad_mV), "\n")
+cat("'majority of day' -- sensor-days flagged:", sum(day_flags_majority$flag_bad_mV), "\n")
+cat("Sensor-days PROTECTED from exclusion by using 'majority of day':",
+    sum(day_flags_any$flag_bad_mV) - sum(day_flags_majority$flag_bad_mV), "\n")
+
+cat("\nNear-zero mV days where F did NOT exceed 0.005 (not auto-flagged either way --\n")
+cat("worth spot-checking manually, could be genuine near-zero-flow periods):\n")
+cat(sum(day_flags_majority$flag_zero_mV & !day_flags_majority$flag_high_F), "\n")
+
+# ── Step 4: visual check, one PNG per Site, red = would be excluded ────────
+# Heavily subsample NOT-flagged points (grey, tens of millions of rows --
+# too many to render) but keep ALL flagged points (red, small enough to
+# plot in full), so no flagged point is lost to sampling.
+sf_data_review <- sf_data %>%
+  left_join(day_flags_majority %>% select(Site, Plot, Sensor_ID, day, flag_bad_mV),
+            by = c("Site", "Plot", "Sensor_ID", "day")) %>%
+  mutate(flag_bad_mV = coalesce(flag_bad_mV, FALSE))
+
+set.seed(42)
+
+not_flagged_sample <- sf_data_review %>%
+  filter(!flag_bad_mV, !is.na(F), is.finite(F)) %>%
+  slice_sample(n = 150000)
+
+flagged_all <- sf_data_review %>%
+  filter(flag_bad_mV, !is.na(F), is.finite(F))
+
+plot_data <- bind_rows(not_flagged_sample, flagged_all) %>%
+  mutate(flag_label = if_else(flag_bad_mV, "Flagged (bad mV)", "Not flagged"))
+
+dir.create("qaqc_flag_check_by_site", showWarnings = FALSE)
+
+for (s in unique(plot_data$Site)) {
+
+  site_data <- plot_data %>% filter(Site == s)
+
+  p_F_flag <- site_data %>%
+    ggplot(aes(x = day, y = F, color = flag_label)) +
+    facet_wrap(~Plot, scales = "free_y") +
+    geom_point(size = 0.6, alpha = 0.4) +
+    scale_color_manual(values = c("Not flagged" = "grey70", "Flagged (bad mV)" = "red")) +
+    labs(x = NULL, y = expression("F (cm"^3*" cm"^-2*" s"^-1*")"), color = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none")
+
+  p_sapflow_flag <- site_data %>%
+    ggplot(aes(x = day, y = sapflow.3.5cm, color = flag_label)) +
+    facet_wrap(~Plot, scales = "free_y") +
+    geom_point(size = 0.6, alpha = 0.4) +
+    scale_color_manual(values = c("Not flagged" = "grey70", "Flagged (bad mV)" = "red")) +
+    labs(x = NULL, y = "Sapflow 3.5cm (mV)", color = NULL) +
+    theme_bw(base_size = 11)
+
+  combined <- (p_F_flag / p_sapflow_flag) +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      title = paste0(s, " \u2014 flag_bad_mV check: red = would be excluded"),
+      subtitle = "Grey points subsampled for rendering; ALL flagged (red) points shown"
+    )
+
+  ggsave(file.path("qaqc_flag_check_by_site", paste0("flag_check_", s, ".png")),
+         plot = combined, width = 12, height = 8, dpi = 150)
+}
+
+cat("\nAll site review plots saved to qaqc_flag_check_by_site/\n")
+cat("Inspect these before running the production QAQC step below.\n")
+```
+
+
+## QAQC step 1 -> flag bad mV ~ 0 obs
+
+Sensors never reach 0 absolute but we are looking for near-zero raw sapflow using quantile(sapflow.3.5cm, 0.01, na.rm = TRUE)
+distribution of per tree near zero thresholds - bimodal split suggest some trees have naturally low baseline signal
+
+TO BE DISCUSsED -> 
+MIN_PCT_NEAR_ZERO:
+Rows before: 19496064 | Rows after: 19064194 | Removed: 431870  ( 2.215 % )
+
+```{r}
+# =============================================================================
+# QAQC STEP 1 — APPLY flag_bad_mV (self-contained)
+#
+# This chunk computes everything it needs from scratch -- it does NOT
+# depend on objects from the diagnosis chunk above. Safe to run on its
+# own, in any session, without running the diagnosis chunk first.
+#
+# Logic (confirmed via the diagnosis investigation above):
+#   1. Per-tree near-zero threshold = 1st percentile of that tree's
+#      positive mV readings (sensors drift near zero, never hit it
+#      exactly -- confirmed on PTR). Computed pooling ALL years per tree
+#      (not per year), since year-to-year threshold instability was
+#      investigated and found unrelated to species or winter coverage --
+#      pooling avoids that instability affecting the flag.
+#   2. flag_zero_mV: TRUE if >= MIN_PCT_NEAR_ZERO of a sensor-day's
+#      observed intervals are near-zero mV (majority-of-day rule --
+#      much more conservative than flagging on a single dip, confirmed
+#      to protect ~6,176 sensor-days from unnecessary exclusion).
+#   3. flag_high_F: TRUE if any F value that sensor-day exceeds the
+#      implausibility cutoff (F > 0.005).
+#   4. flag_bad_mV: TRUE only when BOTH flag_zero_mV AND flag_high_F are
+#      TRUE -- requiring both avoids excluding genuine low-flow days
+#      (near-zero mV alone) or transient noise spikes (implausible F
+#      alone) on their own.
+#
+# The three flag columns (flag_zero_mV, flag_high_F, flag_bad_mV) are
+# written onto sf_data at the day level (same value for every 15-min row
+# on that sensor-day). Re-run safe: any pre-existing versions of these
+# columns are dropped before the join, so running this chunk twice in the
+# same session does not create .x/.y duplicate columns.
+# =============================================================================
+
+# problems with duplicated lines TO be solved later 
+cat("N linhas totais:", nrow(sf_data), "\n")
+cat("N combinações únicas Site+Plot+Sensor_ID+TIMESTAMP:",
+    n_distinct(paste(sf_data$Site, sf_data$Plot, sf_data$Sensor_ID, sf_data$TIMESTAMP)), "\n")
+cat("N linhas duplicadas (a remover):",
+    nrow(sf_data) - n_distinct(paste(sf_data$Site, sf_data$Plot, sf_data$Sensor_ID, sf_data$TIMESTAMP)), "\n")
+
+sf_data <- sf_data %>%
+  distinct(Site, Plot, Sensor_ID, TIMESTAMP, .keep_all = TRUE)
+
+# =============================================================================
+# QAQC STEP 1 — flag_bad_mV (day-level), applied to raw sf_data
+# =============================================================================
+
+MIN_PCT_NEAR_ZERO <- 0.1 # fraction of a day's intervals that must be near-zero to flag
+
+sf_data <- sf_data %>% mutate(day = as.Date(day))
+
+near_zero_thresholds <- sf_data %>%
+  filter(sapflow.3.5cm > 0) %>%
+  group_by(Site, Plot, Sensor_ID) %>%
+  summarise(near_zero_threshold = quantile(sapflow.3.5cm, 0.01, na.rm = TRUE), .groups = "drop")
+
+day_flags <- sf_data %>%
+  left_join(near_zero_thresholds, by = c("Site", "Plot", "Sensor_ID")) %>%
+  filter(!is.na(F), is.finite(F)) %>%
+  group_by(Site, Plot, Sensor_ID, day) %>%
+  summarise(
+    n_obs         = n(),
+    pct_near_zero = sum(sapflow.3.5cm <= near_zero_threshold, na.rm = TRUE) / n_obs,
+    flag_zero_mV  = pct_near_zero >= MIN_PCT_NEAR_ZERO,
+    flag_high_F   = any(F > 0.005, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(flag_bad_mV = flag_zero_mV & flag_high_F)
+
+sf_data <- sf_data %>%
+  select(-any_of(c("flag_zero_mV", "flag_high_F", "flag_bad_mV"))) %>%
+  left_join(day_flags %>% select(Site, Plot, Sensor_ID, day, flag_zero_mV, flag_high_F, flag_bad_mV),
+            by = c("Site", "Plot", "Sensor_ID", "day")) %>%
+  mutate(
+    flag_zero_mV = coalesce(flag_zero_mV, FALSE),
+    flag_high_F  = coalesce(flag_high_F, FALSE),
+    flag_bad_mV  = coalesce(flag_bad_mV, FALSE)
+  )
+
+# ── CASCADE: filter now, Step 2 will operate on this result ────────────────
+sf_data_after_1 <- sf_data %>% filter(!flag_bad_mV)
+
+n0 <- nrow(sf_data)
+n1 <- nrow(sf_data_after_1)
+
+pct_step1 <- round(100 * (n0 - n1) / n0, 3)
+
+cat("=== STEP 1: flag_bad_mV ===\n")
+cat("Rows before:", n0, "| Rows after:", n1, "| Removed:", n0 - n1, " (", pct_step1, "% )\n")
+
+```
+
+## QAQC step 2:  flag_sharp_drop (point-level) mV
+Rows before: 16438458 | Rows after: 16423169 | Removed: 15289  ( 0.093 % of input to this step,  0.091 % of original )
+```{r}
+# =============================================================================
+# QAQC STEP 2 — flag_sharp_drop (point-level)
+# Compares each reading to the median of the PRECEDING window only
+# (backward-looking, not centered) -- a centered window gets contaminated
+# once the drop itself enters the window, masking the transition. This
+# isolates the moment mV falls sharply below its own recent normal range,
+# regardless of that range's absolute scale (works the same for a sensor
+# whose baseline is 0.25 mV or 0.001 mV).
+# =============================================================================
+
+DROP_RATIO_THRESHOLD <- 0.10   # current reading below 10% of the preceding baseline
+LAG_WINDOW_OBS        <- 8      # 8 obs x 15 min = 2h look-back only
+MIN_BASELINE_MV        <- 0.01  # preceding baseline must be at least this for "drop" to be meaningful
+
+sf_data_after_1 <- sf_data_after_1 %>%
+  arrange(Site, Plot, Sensor_ID, TIMESTAMP) %>%
+  group_by(Site, Plot, Sensor_ID) %>%
+  mutate(
+    mV_preceding_median = slide_dbl(
+      sapflow.3.5cm, ~median(.x, na.rm = TRUE),
+      .before = LAG_WINDOW_OBS, .after = -1, .complete = FALSE
+    ),
+    drop_ratio = sapflow.3.5cm / mV_preceding_median,
+    flag_sharp_drop = coalesce(
+      mV_preceding_median >= MIN_BASELINE_MV & drop_ratio < DROP_RATIO_THRESHOLD,
+      FALSE
+    )
+  ) %>%
+  ungroup()
+
+# ── CASCADE: filter now, Step 3 will operate on this result ────────────────
+sf_data_after_2 <- sf_data_after_1 %>% filter(!flag_sharp_drop)
+
+n2 <- nrow(sf_data_after_2)
+pct_step2 <- round(100 * (n1 - n2) / n1, 3)
+pct_step2_of_original <- round(100 * (n1 - n2) / n0, 3)
+
+cat("=== STEP 2: flag_sharp_drop ===\n")
+cat("Rows before:", n1, "| Rows after:", n2, "| Removed:", n1 - n2,
+    " (", pct_step2, "% of input to this step, ", pct_step2_of_original, "% of original )\n")
+
+```
+
+## step 3 ->  flag_sustained_fault (streak-level)
+Rows before: 16423169 | Rows after: 16029591 | Removed: 393578  ( 2.396 % of input to this step,  2.343 % of original )
+```{r}
+# =============================================================================
+# QAQC STEP 3 — flag_sustained_fault (streak-level)
+# Compares each sensor's daily median mV against the median of its
+# SIBLING sensors in the same Site x Plot x day. A sensor sitting far
+# below its siblings for a long, unbroken streak (>= MIN_STREAK_DAYS) is
+# an individual sensor fault that was never fixed in the field -- if it
+# were a real environmental signal (drought, cold), siblings in the same
+# plot would show it too. Every row within such a streak is flagged, not
+# just the day the streak was detected.
+# =============================================================================
+
+SIBLING_RATIO_THRESHOLD <- 0.10   # sensor's own daily median below 10% of the plot's daily median
+MIN_STREAK_DAYS          <- 2     # only sustained streaks count -- short dips belong to Step 2
+
+sibling_comparison <- sf_data_after_2 %>%
+  filter(sapflow.3.5cm > 0) %>%
+  group_by(Site, Plot, day) %>%
+  mutate(plot_daily_median_mV = median(sapflow.3.5cm, na.rm = TRUE),
+         n_sensors_this_day   = n_distinct(Sensor_ID)) %>%
+  ungroup() %>%
+  group_by(Site, Plot, Sensor_ID, day) %>%
+  summarise(sensor_daily_median_mV = median(sapflow.3.5cm, na.rm = TRUE),
+            plot_daily_median_mV   = first(plot_daily_median_mV),
+            n_sensors_this_day     = first(n_sensors_this_day),
+            .groups = "drop") %>%
+  filter(n_sensors_this_day >= 3) %>%
+  mutate(ratio_to_plot_median = sensor_daily_median_mV / plot_daily_median_mV)
+
+streaks <- sibling_comparison %>%
+  filter(!is.na(ratio_to_plot_median)) %>%
+  arrange(Site, Plot, Sensor_ID, day) %>%
+  group_by(Site, Plot, Sensor_ID) %>%
+  mutate(is_low    = ratio_to_plot_median < SIBLING_RATIO_THRESHOLD,
+         streak_id = cumsum(is_low != lag(is_low, default = FALSE))) %>%
+  filter(is_low) %>%
+  group_by(Site, Plot, Sensor_ID, streak_id) %>%
+  summarise(streak_start = min(day), streak_end = max(day), streak_days = n(), .groups = "drop") %>%
+  filter(streak_days >= MIN_STREAK_DAYS)
+
+sustained_fault_days <- streaks %>%
+  rowwise() %>%
+  mutate(day = list(seq(streak_start, streak_end, by = "day"))) %>%
+  ungroup() %>%
+  select(Site, Plot, Sensor_ID, day) %>%
+  unnest(day) %>%
+  mutate(flag_sustained_fault = TRUE)
+
+sf_data_after_2 <- sf_data_after_2 %>%
+  select(-any_of("flag_sustained_fault")) %>%
+  left_join(sustained_fault_days, by = c("Site", "Plot", "Sensor_ID", "day")) %>%
+  mutate(flag_sustained_fault = coalesce(flag_sustained_fault, FALSE))
+
+# ── CASCADE: filter now, Step 4 will operate on this result ────────────────
+sf_data_after_3 <- sf_data_after_2 %>% filter(!flag_sustained_fault)
+
+n3 <- nrow(sf_data_after_3)
+pct_step3 <- round(100 * (n2 - n3) / n2, 3)
+pct_step3_of_original <- round(100 * (n2 - n3) / n0, 3)
+
+cat("=== STEP 3: flag_sustained_fault ===\n")
+cat("Rows before:", n2, "| Rows after:", n3, "| Removed:", n2 - n3,
+    " (", pct_step3, "% of input to this step, ", pct_step3_of_original, "% of original )\n")
+
+```
+
+## step 4 -> removing everything with mV below 0.1 (visual threshdold for real zero // bad sensor or near zero sensor values)
+Rows before: 16029591 | Rows after: 15806402 | Removed: 223189  ( 1.392 % of input to this step,  1.329 % of original )
+
+```{r}
+# =============================================================================
+# QAQC STEP 4 — flag_low_mV (point-level absolute floor)
+# Any observation with raw sapflow.3.5cm < 0.1 is flagged directly, without
+# per-tree calibration -- this is a blunt, final safety net on top of
+# Steps 1-3 (which are per-tree/per-context aware). Combined with Steps
+# 1-3 into a single final exclusion flag, then two rounds of PNGs are
+# saved: (a) Step 4 diagnostic (grey = kept, red = flagged by Step 4),
+# and (b) the FINAL cleaned data after all four steps combined.
+#
+# This chunk is self-contained and long-running (two full render passes
+# across all Sites) -- progress is printed per Site in both rounds so you
+# can check how far it got if you come back to it later.
+# =============================================================================
+
+MV_FLOOR <- 0.1
+
+sf_data_after_3 <- sf_data_after_3 %>%
+  mutate(flag_low_mV = coalesce(sapflow.3.5cm < MV_FLOOR, FALSE))
+
+sf_data_after_4 <- sf_data_after_3 %>% filter(!flag_low_mV)
+
+n4 <- nrow(sf_data_after_4)
+pct_step4 <- round(100 * (n3 - n4) / n3, 3)
+pct_step4_of_original <- round(100 * (n3 - n4) / n0, 3)
+
+cat("=== STEP 4: flag_low_mV (mV <", MV_FLOOR, ") ===\n")
+cat("Rows before:", n3, "| Rows after:", n4, "| Removed:", n3 - n4,
+    " (", pct_step4, "% of input to this step, ", pct_step4_of_original, "% of original )\n")
+
+rm(sf_data_after_3, sf_data_after_2, sf_data_after_1)
+gc()
+
+clean_plot_data_final <- sf_data_after_4 %>%
+  filter(is.finite(F)) %>%
+  select(Site, Plot, Sensor_ID, TIMESTAMP, day, F, sapflow.3.5cm,
+         flag_bad_mV, flag_sharp_drop, flag_sustained_fault, flag_low_mV) %>%
+  mutate(day = as.Date(day))
+
+gc()
+```
+## QAQC step 5 visual checks for bad days
+Rows before (valid F): 7903290 | Rows after: 7845887 | Removed: 57403  ( 0.726 % of valid data,  0.342 % of original )
+
+```{r}
+
+
+# =============================================================================
+# Manual spot-check list: specific Site/Plot/Sensor_ID/day combinations
+# (single days or ranges) flagged for visual inspection across the full
+# dataset. Single days are entered as a 1-day range (start_day == end_day)
+# so the same join logic handles both cases uniformly.
+# =============================================================================
+
+manual_checks <- tribble(
+  ~Site,  ~Plot, ~Sensor_ID, ~start_day,   ~end_day,
+  "PTR",  "UP",  "01",       "2022-06-15", "2022-06-15",
+  "PTR",  "UP",  "08",       "2022-07-18", "2022-07-18",
+  "PTR",  "UP",  "06",       "2022-07-18", "2022-07-18",
+  "PTR",  "UP",  "01",       "2023-07-10", "2023-07-10",
+  "PTR",  "UP",  "03",       "2024-06-27", "2024-06-27",
+  "PTR",  "UP",  "03",       "2024-06-30", "2024-09-22",
+  "PTR",  "UP",  "05",       "2025-01-01", "2025-01-01",
+  "PTR",  "UP",  "05",       "2025-07-28", "2025-08-06",
+  
+  "PTR",  "TR",  "05",      "2023-03-09", "2023-03-17",
+  "PTR",  "TR",  "06",      "2023-03-09", "2023-03-17",
+  "PTR",  "TR",  "07",      "2023-03-09", "2023-03-17",
+  "PTR",  "TR",  "05",      "2023-03-09", "2023-03-17",
+  "PTR",  "TR",  "06",      "2025-06-19", "2025-06-21",
+  "PTR",  "TR",  "05",      "2025-06-19", "2025-06-21",
+  "PTR",  "TR",  "07",      "2025-07-27", "2025-07-27",
+  "PTR",  "TR",  "07",      "2025-06-19", "2025-06-21",
+  "PTR",  "TR",  "07",      "2025-11-01", "2025-11-11",
+  "PTR",  "TR",  "01",      "2025-12-31", "2025-12-31",
+  "PTR",  "TR",  "03",      "2025-12-31", "2025-12-31",
+  
+  "CRC",  "TR",  "06",      "2023-11-23", "2023-11-23",
+  "CRC",  "TR",  "05",      "2024-10-19", "2024-10-19",
+  "CRC",  "TR",  "06",      "2023-11-23", "2023-11-23",
+  
+  "CRC",  "UP",  "04",      "2023-02-22", "2023-02-24",
+  "CRC",  "UP",  "06",      "2023-02-22", "2023-02-24",
+  "CRC",  "UP",  "07",      "2024-02-29", "2024-03-01",
+  "CRC",  "UP",  "02",      "2024-02-29", "2024-03-01",
+  "CRC",  "UP",  "05",      "2025-01-12", "2025-01-17",
+  "CRC",  "UP",  "01",      "2025-01-19", "2025-01-31",
+  "CRC",  "UP",  "04",      "2025-05-03", "2025-05-10",
+  "CRC",  "UP",  "08",      "2025-06-11", "2025-06-12",
+  "CRC",  "UP",  "05",      "2025-06-11", "2025-06-12",
+  "CRC",  "UP",  "01",      "2025-08-17", "2025-10-24",
+  "CRC",  "UP",  "03",      "2025-11-24", "2025-11-28",
+  
+  "OWC",  "UP",  "03",      "2025-01-03", "2025-01-04",
+  "OWC",  "UP",  "01",      "2025-05-23", "2025-12-31",
+  
+  "OWC",  "TR",  "01",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "02",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "03",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "04",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "05",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "06",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "07",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "08",      "2022-08-22", "2022-08-24",
+  "OWC",  "TR",  "07",      "2022-07-11", "2022-07-11",
+  "OWC",  "TR",  "01",      "2024-11-03", "2024-11-03",
+  "OWC",  "TR",  "02",      "2024-11-03", "2024-11-03",
+  "OWC",  "TR",  "03",      "2024-11-03", "2024-11-03",
+  "OWC",  "TR",  "04",      "2025-05-17", "2025-08-21",
+  "OWC",  "TR",  "05",      "2025-05-17", "2025-08-21",
+  
+  "GCW",  "TR",  "01",      "2025-05-16", "2025-06-18",
+  "GCW",  "UP",  "C2",      "2025-06-02", "2025-06-02",
+  "GCW",  "UP",  "C12",      "2025-12-31", "2025-12-31",
+  
+  "GWI",  "UP",  "04",      "2025-10-13", "2025-10-16",
+  "GWI",  "UP",  "05",      "2025-10-13", "2025-10-16",
+  "GWI",  "UP",  "02",      "2023-12-24", "2023-12-24",
+  "GWI",  "UP",  "03",      "2023-11-09", "2023-11-09",
+  "GWI",  "UP",  "02",      "2023-11-09", "2023-11-09",
+  
+  "GWI",  "TR",  "07",      "2022-03-17", "2022-04-07",
+  "GWI",  "TR",  "08",      "2022-03-17", "2022-04-07",
+  "GWI",  "TR",  "01",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "02",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "03",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "04",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "05",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "06",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "07",      "2023-09-06", "2023-09-06",
+  "GWI",  "TR",  "08",      "2023-09-06", "2023-09-06",
+  
+  "GWI",  "UP",  "02",      "2023-12-24", "2023-12-24",
+  "GWI",  "UP",  "02",      "2023-11-09", "2023-11-09",
+  "GWI",  "UP",  "03",      "2023-11-09", "2023-11-09",
+  "GWI",  "UP",  "04",      "2025-10-12", "2025-10-12",
+  "GWI",  "UP",  "05",      "2025-10-12", "2025-10-12",
+  "GWI",  "UP",  "06",      "2025-10-12", "2025-10-12",
+  "GWI",  "UP",  "01",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "02",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "03",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "04",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "05",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "06",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "07",      "2023-09-06", "2023-09-06",
+  "GWI",  "UP",  "08",      "2023-09-06", "2023-09-06",
+  
+  "MSM",  "UP",  "05",      "2025-02-16", "2025-02-22",
+  "MSM",  "UP",  "05",      "2024-12-01", "2024-12-04",
+  
+  "MSM",  "TR",  "05",      "2024-12-11", "2024-12-11",
+  "MSM",  "TR",  "05",      "2025-12-19", "2025-12-31",
+  
+  "SWH",  "TR",  "05",      "2023-06-29", "2023-06-29",
+  "SWH",  "TR",  "06",      "2023-06-29", "2023-06-29",
+  "SWH",  "TR",  "05",      "2023-10-18", "2023-10-18",
+  "SWH",  "TR",  "06",      "2023-10-18", "2023-10-18",
+  "SWH",  "TR",  "05",      "2023-11-18", "2023-11-18",
+  "SWH",  "TR",  "06",      "2023-11-18", "2023-11-18",
+  "SWH",  "TR",  "01",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "02",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "03",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "04",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "05",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "06",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "07",      "2024-11-13", "2024-11-13",
+  "SWH",  "TR",  "08",      "2024-11-13", "2024-11-13",
+  
+  "SWH",  "SWAMP",  "04",      "2025-05-10", "2025-05-10",
+  "SWH",  "SWAMP",  "07",      "2024-10-01", "2024-10-27",
+  
+) %>%
+  mutate(start_day = as.Date(start_day), end_day = as.Date(end_day))
+
+library(fuzzyjoin)
+library(purrr)
+library(patchwork)
+
+# =============================================================================
+# CHECK INF/NA: F non-finite (NA/Inf/NaN) is NOT a QAQC removal step -- it's
+# missing/uncomputable data (e.g. nights with no accepted dTmax observation
+# propagate F = NA; near-zero mV can still produce Inf via the Granier
+# division). Counted here SEPARATELY from the Manual Flag step so the
+# manual-flag percentage isn't diluted by data that was never eligible for
+# manual review. clean_plot_data_final was already built with
+# filter(is.finite(F)), so no non-finite rows are ever saved to disk.
+# =============================================================================
+
+n4_all       <- nrow(sf_data_after_4)                 # everything, finite + non-finite
+n4_nonfinite <- sum(!is.finite(sf_data_after_4$F))
+n4_valid     <- n4_all - n4_nonfinite                  # finite F only -- base for manual flag %
+
+cat("=== CHECK INF/NA (informational, not a removal step) ===\n")
+cat("Total rows entering this stage:", n4_all, "\n")
+cat("Rows with non-finite F (NA/Inf/NaN):", n4_nonfinite,
+    " (", round(100 * n4_nonfinite / n4_all, 3), "% of total )\n")
+cat("Rows with valid (finite) F:", n4_valid,
+    " (", round(100 * n4_valid / n4_all, 3), "% of total )\n")
+
+cat("\nBreakdown -- N com F = NA:", sum(is.na(sf_data_after_4$F)), "\n")
+cat("Breakdown -- N com F = Inf/-Inf:", sum(is.infinite(sf_data_after_4$F)), "\n")
+cat("Breakdown -- N com F = NaN:", sum(is.nan(sf_data_after_4$F)), "\n")
+
+cat("\nNon-finite F by Site x Plot:\n")
+print(as.data.frame(
+  sf_data_after_4 %>%
+    group_by(Site, Plot) %>%
+    summarise(
+      n_total = n(),
+      n_nonfinite_F = sum(!is.finite(F)),
+      pct_nonfinite = round(100 * n_nonfinite_F / n_total, 1),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(pct_nonfinite))
+))
+
+cat("\nDe quantos F=NA, quantos tambem tem dTmax_final = NA:\n")
+f_na_rows <- sf_data_after_4 %>% filter(is.na(F))
+cat(sum(is.na(f_na_rows$dTmax_final)), "de", nrow(f_na_rows), "\n")
+
+
+# =============================================================================
+# MANUAL FLAG -- applied to clean_plot_data_final (already filtered to
+# finite F only, so no Inf/NA rows are present or ever saved to disk). n4
+# here is the VALID-F count (n4_valid above), so pct_manual reflects
+# removal relative to data that was actually eligible for review.
+# =============================================================================
+
+n4 <- n4_valid
+
+manual_checks <- manual_checks %>%
+  mutate(
+    row_id = row_number(),
+    date_parse_valid = !is.na(start_day) & !is.na(end_day),
+    date_range_valid = date_parse_valid & (end_day >= start_day)
+  )
+
+malformed_rows <- manual_checks %>% filter(!date_parse_valid)
+if (nrow(malformed_rows) > 0) {
+  cat("*** WARNING:", nrow(malformed_rows), "rows have unparseable dates ***\n")
+  print(as.data.frame(malformed_rows %>% select(row_id, Site, Plot, Sensor_ID, start_day, end_day)))
+}
+
+invalid_rows <- manual_checks %>% filter(date_parse_valid & !date_range_valid)
+if (nrow(invalid_rows) > 0) {
+  cat("*** WARNING:", nrow(invalid_rows), "rows have end_day < start_day and were EXCLUDED ***\n")
+  print(as.data.frame(invalid_rows %>% select(row_id, Site, Plot, Sensor_ID, start_day, end_day)))
+}
+
+manual_checks_valid <- manual_checks %>% filter(date_range_valid)
+
+manual_check_days <- manual_checks_valid %>%
+  mutate(day = map2(start_day, end_day, seq, by = "day")) %>%
+  select(Site, Plot, Sensor_ID, day) %>%
+  unnest(day) %>%
+  distinct(Site, Plot, Sensor_ID, day) %>%
+  mutate(flag_manual_check = TRUE)
+
+all_flagged <- clean_plot_data_final %>%
+  left_join(manual_check_days, by = c("Site", "Plot", "Sensor_ID", "day")) %>%
+  mutate(flag_manual_check = coalesce(flag_manual_check, FALSE))
+
+# ── final pre-MAD dataset: finite F only (inherited from clean_plot_data_final),
+# manually flagged rows removed ──────────────────────────────────────────────
+sf_data_clean_manual <- all_flagged %>% filter(!flag_manual_check)
+
+n5 <- nrow(sf_data_clean_manual)
+pct_manual <- round(100 * (n4 - n5) / n4, 3)
+pct_manual_of_original <- round(100 * (n4 - n5) / n0, 3)
+
+cat("=== MANUAL FLAG (base: valid-F rows only) ===\n")
+cat("Rows before (valid F):", n4, "| Rows after:", n5, "| Removed:", n4 - n5,
+    " (", pct_manual, "% of valid data, ", pct_manual_of_original, "% of original )\n")
+
+cat("\n=== CASCADE TOTAL (Steps 1-4 + non-finite F + Manual) ===\n")
+cat("Original rows:", n0, "\n")
+cat("Removed by Steps 1-4:", n0 - n4_all, "\n")
+cat("Removed as non-finite F (informational, never saved):", n4_nonfinite, "\n")
+cat("Removed by Manual Flag:", n4 - n5, "\n")
+cat("Final rows:", n5, "\n")
+cat("Total removed:", n0 - n5, " (", round(100 * (n0 - n5) / n0, 3), "% )\n")
+
+# ── sanity check: confirm no non-finite F ever made it into the saved file ──
+stopifnot(all(is.finite(sf_data_clean_manual$F)))
+
+write.csv(sf_data_clean_manual, "sf_data_preMAD_step1to5.csv", row.names = FALSE)
+cat("\nSaved: sf_data_preMAD_step1to5.csv (", nrow(sf_data_clean_manual),
+    "rows, all F finite, before MAD)\n")
+```
+## Plot FLAGS all together
+```{r}
+## Plot: all QAQC flags, colored, saved to FLAGS_ID
+library(patchwork)
+
+# =============================================================================
+# Combined visual QC: every flag from the cascade (Steps 1-4, non-finite F,
+# Manual Flag) joined back onto the deduplicated sf_data by row key, colored
+# by WHICH flag caught each point, with priority order when more than one
+# applies (bad_mV > sharp_drop > sustained_fault > low_mV > non-finite F >
+# manual_check > None). F (top) and raw mV (bottom), faceted by Plot, one
+# PNG per Site, saved to FLAGS_ID/ -- gray = kept, colored = excluded.
+# =============================================================================
+
+sf_data_all_flags <- sf_data %>%
+  left_join(
+    sf_data_after_1 %>% select(Site, Plot, Sensor_ID, TIMESTAMP, flag_sharp_drop),
+    by = c("Site", "Plot", "Sensor_ID", "TIMESTAMP")
+  ) %>%
+  left_join(
+    sf_data_after_2 %>% select(Site, Plot, Sensor_ID, TIMESTAMP, flag_sustained_fault),
+    by = c("Site", "Plot", "Sensor_ID", "TIMESTAMP")
+  ) %>%
+  left_join(
+    sf_data_after_3 %>% select(Site, Plot, Sensor_ID, TIMESTAMP, flag_low_mV),
+    by = c("Site", "Plot", "Sensor_ID", "TIMESTAMP")
+  ) %>%
+  left_join(
+    manual_check_days %>% select(Site, Plot, Sensor_ID, day, flag_manual_check),
+    by = c("Site", "Plot", "Sensor_ID", "day")
+  ) %>%
+  mutate(
+    flag_bad_mV           = coalesce(flag_bad_mV, FALSE),
+    flag_sharp_drop        = coalesce(flag_sharp_drop, FALSE),
+    flag_sustained_fault   = coalesce(flag_sustained_fault, FALSE),
+    flag_low_mV             = coalesce(flag_low_mV, FALSE),
+    flag_manual_check       = coalesce(flag_manual_check, FALSE),
+    flag_nonfinite_F        = !is.finite(F),
+    flag_type = case_when(
+      flag_bad_mV           ~ "Bad mV (Step 1)",
+      flag_sharp_drop        ~ "Sharp drop (Step 2)",
+      flag_sustained_fault   ~ "Sustained fault (Step 3)",
+      flag_low_mV             ~ "Low mV floor (Step 4)",
+      flag_nonfinite_F        ~ "Non-finite F (NA/Inf/NaN)",
+      flag_manual_check       ~ "Manual check",
+      TRUE                    ~ "Not flagged"
+    )
+  )
+
+set.seed(42)
+
+not_flagged_sample <- sf_data_all_flags %>%
+  filter(flag_type == "Not flagged") %>%
+  slice_sample(n = 150000)
+
+flagged_all <- sf_data_all_flags %>%
+  filter(flag_type != "Not flagged", flag_type != "Non-finite F (NA/Inf/NaN)")
+
+nonfinite_sample <- sf_data_all_flags %>%
+  filter(flag_type == "Non-finite F (NA/Inf/NaN)") %>%
+  slice_sample(n = min(50000, sum(sf_data_all_flags$flag_type == "Non-finite F (NA/Inf/NaN)")))
+
+plot_data <- bind_rows(not_flagged_sample, flagged_all, nonfinite_sample) %>%
+  mutate(
+    day = as.Date(day),
+    flag_type = factor(flag_type, levels = c(
+      "Not flagged", "Bad mV (Step 1)", "Sharp drop (Step 2)",
+      "Sustained fault (Step 3)", "Low mV floor (Step 4)",
+      "Non-finite F (NA/Inf/NaN)", "Manual check"
+    ))
+  )
+
+flag_colors <- c(
+  "Not flagged"                = "grey70",
+  "Bad mV (Step 1)"            = "red",
+  "Sharp drop (Step 2)"        = "orange",
+  "Sustained fault (Step 3)"   = "purple",
+  "Low mV floor (Step 4)"      = "blue",
+  "Non-finite F (NA/Inf/NaN)"  = "black",
+  "Manual check"               = "darkgreen"
+)
+
+dir.create("FLAGS_ID", showWarnings = FALSE)
+
+for (s in unique(plot_data$Site)) {
+
+  site_data <- plot_data %>% filter(Site == s)
+
+  p_F <- site_data %>%
+    filter(is.finite(F)) %>%
+    ggplot(aes(x = day, y = F, color = flag_type)) +
+    facet_wrap(~Plot, scales = "free_y") +
+    geom_point(size = 0.6, alpha = 0.4) +
+    scale_color_manual(values = flag_colors, drop = FALSE) +
+    labs(x = NULL, y = expression("F (cm"^3*" cm"^-2*" s"^-1*")"), color = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none")
+
+  p_mV <- site_data %>%
+    ggplot(aes(x = day, y = sapflow.3.5cm, color = flag_type)) +
+    facet_wrap(~Plot, scales = "free_y") +
+    geom_point(size = 0.6, alpha = 0.4) +
+    geom_hline(yintercept = 0.1, color = "red", linetype = "dashed", linewidth = 0.6) +
+    scale_color_manual(values = flag_colors, drop = FALSE) +
+    labs(x = NULL, y = "Sapflow 3.5cm (mV)", color = NULL) +
+    theme_bw(base_size = 11)
+
+  combined <- (p_F / p_mV) +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      title = paste0(s, " \u2014 all QAQC flags: red=bad mV, orange=sharp drop, purple=sustained fault, blue=low mV floor, black=non-finite F, green=manual"),
+      subtitle = "Gray = kept. Dashed red line = 0.1 mV reference. Gray/black subsampled for rendering; other flagged points shown in full"
+    )
+
+  ggsave(file.path("FLAGS_ID", paste0("flags_id_", s, ".png")),
+         plot = combined, width = 12, height = 8, dpi = 150)
+
+  cat("Saved:", s, "\n")
+}
+
+cat("\nAll flagged/colored review plots saved to 'FLAGS_ID/'\n")
+```
+
+
+## Plot clean data FINAL after QAQC steps 1, 2, 3, 4
+```{r}
+
+library(patchwork)
+
+# =============================================================================
+# Final plots: F (top) and raw mV (bottom), by Site, faceted by Plot --
+# AFTER all QAQC exclusions (Steps 1-4: bad mV, sharp drop, sustained
+# fault, mV < 0.1, PLUS the manual spot-check list). This is the fully
+# cleaned dataset, one PNG per Site.
+# =============================================================================
+
+## Plot after full QAQC (Steps 1-4 + Manual) -- clean, F only
+dir.create("Plots_after_QAQC", showWarnings = FALSE)
+
+final_plot_data <- sf_data_clean_manual %>%
+  filter(is.finite(F)) %>%
+  mutate(day = as.Date(day))
+
+for (s in unique(final_plot_data$Site)) {
+
+  site_data <- final_plot_data %>% filter(Site == s)
+
+  p_F_final <- site_data %>%
+    ggplot(aes(x = day, y = F, color = Sensor_ID)) +
+    facet_wrap(~Plot, scales = "free_y") +
+    geom_point(size = 0.6, alpha = 0.4) +
+    labs(x = NULL, y = expression("F (cm"^3*" cm"^-2*" s"^-1*")"),
+         title = paste0(s, " \u2014 Final F after full QAQC (Steps 1-4 + manual review)"),
+         subtitle = "Bad mV, sharp drop, sustained fault, mV < 0.1, and manually flagged intervals all removed") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none")
+
+  ggsave(file.path("Plots_after_QAQC", paste0("final_", s, ".png")),
+         plot = p_F_final, width = 12, height = 6, dpi = 150)
+
+  cat("Saved:", s, "\n")
+}
+
+cat("\nAll final QAQC plots (F only) saved to 'Plots_after_QAQC/'\n")
+
+```
+
+## QAQC step 5-> flag outliers: MAD outlier after removing bad mV obs
+
+```{r}
+# =============================================================================
+# FINAL PRODUCTION FILTER: MAD-based outlier removal on F, replacing the
+# arbitrary F > 0.005 cutoff.
+#
+# NOTE: temporal cutoff (2022-01-01 to 2025-12-31) is already applied
+# upstream, in the "A Little Tidying" chunk, so it does not need to be
+# repeated here -- sf_data at this point already only contains that window.
+#
+# Per-tree (Site x Plot x Sensor_ID), day/night split (pooling day+night
+# distorts the median/MAD toward whichever regime dominates), with a MAD
+# floor to prevent z-score blow-up during near-zero-variance periods.
+#
+# THRESHOLD SELECTION (MAD_THRESHOLD = 3.5): a sensitivity sweep (2.5-6.0)
+# showed the TR > UP outlier-rate gap persists at every threshold tested --
+# structural (real behavioral difference, e.g. nighttime recharge in wetter
+# transition plots), not an artifact of the threshold choice. TO DO Visual
+# inspection of points flagged only by MAD (not by the old F>0.005 cutoff)
+# showed plausible physiological signal (nighttime recharge, daytime peak-
+# demand events) Iglewicz & Hoaglin
+# default (3.5) to avoid over-removing real variation. Result: ~XX% of
+# valid-F rows flagged.
+
+#
+# IMPORTANT FIX: sf_data_clean_mV contains duplicated Site x Plot x Sensor_ID x
+# TIMESTAMP rows (confirmed diagnostic: 2,524,704 duplicated combinations).
+# These MUST be removed before any join, or a join keyed on those columns
+# silently inflates row counts. Also using left_join (not inner_join) below
+# so rows with F = NA/Inf are preserved as-is, not silently dropped by a
+# join mismatch and confused with MAD-flagged outliers.
+#
+# NOTE on persistently noisy sensors: 16 sensors (mostly OWC/PTR/CRC --
+# Lake Erie) show a >15% MAD outlier rate that is IDENTICAL whether or not
+# the 2026 temporal cutoff is applied, ruling out 2026-specific sensor
+# degradation as the explanation for these specific sensors -- the elevated
+# rate is a structural property of these sensors/trees across the full
+# 2022-2025 record. They are NOT excluded wholesale (no evidence of full
+# sensor failure); their worst points are still removed by the per-tree
+# MAD filter below like any other sensor. Flagged here for QA transparency.
+# =============================================================================
+
+# =============================================================================
+# QAQC STEP 5 — MAD outlier removal
+# (= final output of the full cascade: Steps 1-4 + Manual Flag)
+# =============================================================================
+
+MAD_THRESHOLD <-3.5
+
+sf_data_clean_mV <- final_plot_data %>%
+  distinct(Site, Plot, Sensor_ID, TIMESTAMP, .keep_all = TRUE)
+
+n_before_mad <- nrow(sf_data_clean_mV)
+
+daytime_median_F <- sf_data_clean_mV %>%
+  filter(!is.na(F), is.finite(F), wx.par.den15 > 5) %>%
+  pull(F) %>% median(na.rm = TRUE)
+
+MAD_FLOOR <- daytime_median_F * 0.01
+
+mad_check <- sf_data_clean_mV %>%
+  filter(!is.na(F), is.finite(F)) %>%
+  mutate(is_daylight = wx.par.den15 > 5) %>%
+  group_by(Site, Plot, Sensor_ID, is_daylight) %>%
+  mutate(
+    F_median = median(F, na.rm = TRUE),
+    F_mad    = pmax(mad(F, na.rm = TRUE), MAD_FLOOR),
+    F_mod_z  = 0.6745 * (F - F_median) / F_mad,
+    F_is_outlier_mad = abs(F_mod_z) > MAD_THRESHOLD
+  ) %>%
+  ungroup()
+
+sf_data_qaqc <- sf_data_clean_mV %>%
+  left_join(mad_check %>% select(Site, Plot, Sensor_ID, TIMESTAMP, F_is_outlier_mad),
+            by = c("Site", "Plot", "Sensor_ID", "TIMESTAMP")) %>%
+  mutate(F_is_outlier_mad = coalesce(F_is_outlier_mad, FALSE)) %>%
+  filter(!F_is_outlier_mad) %>%
+  select(-F_is_outlier_mad) %>%
+  filter(is.na(F) | is.finite(F))   # drop Inf/NaN artifacts from the Granier blow-up
+
+n_after_mad <- nrow(sf_data_qaqc)
+pct_mad <- round(100 * (n_before_mad - n_after_mad) / n_before_mad, 3)
+pct_mad_of_original <- round(100 * (n_before_mad - n_after_mad) / n0, 3)
+
+cat("=== STEP 5: MAD (threshold =", MAD_THRESHOLD, ") ===\n")
+cat("Rows before:", n_before_mad, "| Rows after:", n_after_mad, "| Removed:", n_before_mad - n_after_mad,
+    " (", pct_mad, "% of input to this step, ", pct_mad_of_original, "% of original )\n")
+# SUBTITLE NOTE: MAD removed pct_mad_of_original = ", pct_mad_of_original, "% of original rows
+
+cat("\n=== FULL PIPELINE TOTAL (Steps 1-5) ===\n")
+cat("Original rows:", n0, "\n")
+cat("Final rows:   ", n_after_mad, "\n")
+cat("Total removed:", n0 - n_after_mad, " (", round(100 * (n0 - n_after_mad) / n0, 3), "% )\n")
+```
 
 ### Scaling to Sapwood Area  
 
@@ -262,38 +1779,40 @@ ggplot(scaled_plot_avg) +
 
 ## Comparison of Values  
 
-
 ```{r Comparison}
-compute_avg_sapflow <- function(data, target_date) {
-  data %>% 
-    mutate(Hour = hour(TIMESTAMP),
-           Date = date(TIMESTAMP)) %>%
-    filter(Date == target_date,
-           Species == "Tulip Poplar",
-           `F` <= 0.005) %>%
-    group_by(Plot, Date, Hour) %>%
-    summarize(F_avg = mean(Fd * 3.6))
-    
-}
+# hour average per Site, Plot, Season, Hour
+sf_seasonal_hourly <- sf_data_qaqc %>%  
+  mutate(Hour   = hour(TIMESTAMP),
+         DOY    = yday(TIMESTAMP),
+         Season = case_when(DOY >= 355 | DOY <  80  ~ "Winter", 
+           DOY >= 80  & DOY < 172 ~ "Spring",
+           DOY >= 172 & DOY < 266 ~ "Summer",
+           DOY >= 266 & DOY < 355 ~ "Fall")) %>%
+  filter(!is.na(Season),         
+         #F <= 0.005,# we are using sf_data_qaqc with filter based on MAD 
+         !is.na(F)) %>%
+  group_by(Site, Plot, Season, Hour) %>%
+  summarise(F_avg = mean(F * 3600, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(Season = factor(Season, levels = c("Spring", "Summer", "Fall", "Winter")))
 
-# Compute averages for June and July dates
-sf_plot_avg_june <- compute_avg_sapflow(sf_data, "2022-06-12")
-sf_plot_avg_july <- compute_avg_sapflow(sf_data, "2022-07-06")
 
-
-p_june <- ggplot(sf_plot_avg_june) + 
-  geom_point(aes(x = Hour, y = F_avg, color = Plot)) + 
-  geom_line(aes(x = Hour, y = F_avg, color = Plot)) +
-  labs(y = "Sap Flow L/h", x = "Hour", title = "LITU, June 12th 2022") +
-  theme_minimal()
-
-p_july <- ggplot(sf_plot_avg_july) + 
-  geom_point(aes(x = Hour, y = F_avg, color = Plot)) +
-  geom_line(aes(x = Hour, y = F_avg, color = Plot)) +
-  labs(y = "Sap Flow L/h", x = "Hour", title = "LITU, July 6th 2022") +
-  theme_minimal()
-
-ggarrange(p_june, p_july, ncol = 2, common.legend = TRUE, legend="bottom")
+# plot
+ggplot(sf_seasonal_hourly, aes(x = Hour, y = F_avg, color = Season)) +
+  geom_point(size = 1.2, alpha = 0.8) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c("Spring" = "#4DAF4A",
+                                "Summer" = "#E41A1C",
+                                "Fall"   = "#FF7F00",
+                                "Winter"   = "#000080")) +
+  facet_grid(Site ~ Plot) +
+  labs(y     = "Sap Flux Density (cm3 cm-2 h-1)",
+       x     = "Hour of Day",
+       color = "Season",
+       title = "Diurnal Pattern of Sap Flux Density by Site, Zone and Season") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text      = element_text(face = "bold"))
 
 ```
 <br><br>
@@ -305,4 +1824,160 @@ Comparison data for LITU, May (C) and June (D) sap flow volume in Georgia ![Comp
 <br><br>
 *Effects of stem size on stem respiration and its flux components in yellow-poplar (Liriodendron tulipifera L.) trees* [Fan et al 2017](https://doi.org/10.1093/treephys/tpx084) 
 <br><br>
+
+## Midday sap flux density, per Site x Plot x Species x Date
+
+```{r}
+# =============================================================================
+# sf_plot_avg: midday (11:00-12:00) sap flux density, averaged per
+# Site x Plot x Species x Date. Source is sf_data_qaqc (deduplicated, MAD-
+# filtered, Inf/NaN removed) -- NOT the old F<=0.005 cutoff, which the MAD
+# filter now replaces.
+#
+# Midday window + high-PAR filter (wx.par.den15 > 800) isolates peak
+# stomatal activity under clear-sky conditions, avoiding cloudy/rainy-day
+# noise in the daily summary used for the UP vs TR comparison downstream.
+# =============================================================================
+
+sf_plot_avg <- sf_data_qaqc %>%
+  mutate(
+    Hour   = hour(TIMESTAMP),
+    Date   = as.Date(TIMESTAMP),
+    DOY    = yday(TIMESTAMP),
+    Season = case_when(
+      DOY >= 355 | DOY < 80  ~ "Winter",
+      DOY >= 80  & DOY < 172 ~ "Spring",
+      DOY >= 172 & DOY < 266 ~ "Summer",
+      DOY >= 266 & DOY < 355 ~ "Fall"
+    )
+  ) %>%
+  filter(
+    Hour >= 11, Hour <= 12,
+    !is.na(F),
+    Season != "Winter",
+    wx.par.den15 > 800   # removes cloudy/rainy days
+  ) %>%
+  group_by(Site, Plot, Species, Date) %>%
+  summarise(F_avg = mean(F * 3600, na.rm = TRUE), .groups = "drop")   # cm3 cm-2 s-1 -> cm3 cm-2 h-1
+
+cat("sf_plot_avg rows:", nrow(sf_plot_avg), "\n")
+print(summary(sf_plot_avg$F_avg))
+```
+
+
+# statistical comparison between Plots
+
+```{r}
+library(rstatix)
+
+# =============================================================================
+# sf_daily: keeps original Plot labels (UP, TR, SWAMP) -- no recoding.
+# Each Site is paired-tested using whichever TWO Plot levels it actually has
+# (most sites: UP vs TR; SWH: TR vs SWAMP, since it has no true UP).
+# =============================================================================
+
+sf_daily <- sf_plot_avg %>%
+  ungroup() %>%
+  mutate(
+    Plot = factor(Plot, levels = c("UP", "TR", "SWAMP")),
+    Site = factor(Site, levels = c("CRC", "PTR", "OWC", "GWI", "MSM", "SWH", "GCW"))
+  ) %>%
+  group_by(Site, Plot, Date) %>%
+  summarise(F_avg = mean(F_avg, na.rm = TRUE), .groups = "drop")
+
+cat("Plot levels present per Site:\n")
+sf_daily %>% distinct(Site, Plot) %>% arrange(Site, Plot) %>% print(n = Inf)
+
+# ── Generic paired Wilcoxon test: uses whichever 2 Plot levels exist at
+# each Site, instead of hardcoding UP vs TR ─────────────────────────────────
+
+paired_test <- sf_daily %>%
+  group_by(Site) %>%
+  filter(n_distinct(Plot[!is.na(F_avg)]) == 2) %>%   # only sites with exactly 2 plots
+  group_modify(~ {
+    plots_here <- levels(droplevels(.x$Plot))
+    wide <- .x %>%
+      select(Date, Plot, F_avg) %>%
+      pivot_wider(names_from = Plot, values_from = F_avg) %>%
+      filter(!is.na(.data[[plots_here[1]]]), !is.na(.data[[plots_here[2]]]))
+
+    x <- wide[[plots_here[1]]]
+    y <- wide[[plots_here[2]]]
+
+    w <- wilcox.test(x, y, paired = TRUE)
+
+    tibble(
+      plot_A   = plots_here[1],
+      plot_B   = plots_here[2],
+      n        = nrow(wide),
+      median_A = round(median(x, na.rm = TRUE), 3),
+      median_B = round(median(y, na.rm = TRUE), 3),
+      W_stat   = w$statistic,
+      p_value  = w$p.value
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    sig = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    contrast_label = paste(plot_A, "vs", plot_B)
+  )
+
+print(paired_test)
+
+# =============================================================================
+# Outlier trimming (Tukey IQR fence, 1.5x), per Site x Plot -- affects both
+# the boxplot shape and the y-axis scale, not just visibility
+# =============================================================================
+
+sf_daily_trimmed <- sf_daily %>%
+  filter(!is.na(F_avg)) %>%
+  group_by(Site, Plot) %>%
+  mutate(
+    q1 = quantile(F_avg, 0.25, na.rm = TRUE),
+    q3 = quantile(F_avg, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    lower_fence = q1 - 1.5 * iqr,
+    upper_fence = q3 + 1.5 * iqr
+  ) %>%
+  ungroup() %>%
+  filter(F_avg >= lower_fence, F_avg <= upper_fence) %>%
+  select(-q1, -q3, -iqr, -lower_fence, -upper_fence) %>%
+  droplevels()   # drop unused Plot levels (e.g. UP for SWH) so facets/x-axis are clean
+
+cat("Rows before outlier trim:", sum(!is.na(sf_daily$F_avg)), "\n")
+cat("Rows after outlier trim: ", nrow(sf_daily_trimmed), "\n")
+
+# y position per Site, computed on the TRIMMED data actually being plotted
+sig_y_pos <- sf_daily_trimmed %>%
+  group_by(Site) %>%
+  summarise(y_pos = max(F_avg, na.rm = TRUE) * 1.05, .groups = "drop")
+
+paired_test <- paired_test %>%
+  select(-any_of("y_pos")) %>%
+  left_join(sig_y_pos, by = "Site")
+
+print(paired_test)   # confirm sig and y_pos populated, no NA
+
+# ── Plot: x-axis shows whichever Plot levels each Site actually has ────────
+
+ggplot(sf_daily_trimmed, aes(x = Plot, y = F_avg, fill = Plot)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_text(data = paired_test,
+            aes(x = 1.5, y = y_pos, label = sig),
+            vjust = 0, size = 6, fontface = "bold",
+            inherit.aes = FALSE) +
+  facet_wrap(~Site, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  scale_fill_manual(values = c("UP" = "#A5D6AF", "TR" = "#B891C4", "SWAMP" = "#779ECB")) +
+  labs(y     = "Midday Sap Flux Density (cm3 cm-2 h-1)",
+       title = "Paired Wilcoxon by Site (each Site uses its own two Plot levels)",
+       subtitle = "Most sites: UP vs TR; SWH: TR vs SWAMP") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
 

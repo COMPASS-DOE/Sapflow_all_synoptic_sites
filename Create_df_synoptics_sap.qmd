@@ -1,0 +1,1928 @@
+---
+title: "Sapflow_synoptic_creating_DF"
+author: "Roberta Peixoto"
+format: html
+editor: visual
+---
+
+#Getting L2 data - sap + climavue for  vpd
+
+```{r}
+setwd("D:/COMPASS_L2-v2-1/v2-1")
+
+SITE <- c("OWC","PTR","CRC",
+          "GCW", "GWI", "MSM", "SWH")
+
+VARIABLE <- c("wx-tempavg15",
+              "wx-par-den15", #µmol/m2/s Average photosynthetically active radiation (PAR) flux density ; site specific correction factor applied
+              "wx-rh15",        #degC     Average temperature of humidity sensor 
+              "wx-vpd15",       #kPa      Vapor pressure deficit
+              "sapflow-3.5cm",  #mV       Raw sap flow at 3.5 cm depth
+              "sapflow-5cm",    #mV       Raw sap flow at 5 cm depth
+              "Value_MAC")
+
+all_files <- list.files(
+  "./",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+files <- all_files[
+  grepl(paste(SITE, collapse = "|"), basename(all_files)) &
+    grepl(paste(VARIABLE, collapse = "|"), basename(all_files)) &
+    grepl("_L2_v2-", basename(all_files)) &
+    grepl("\\.parquet$", basename(all_files))
+]
+
+dat <- bind_rows(
+  lapply(files, function(f) {
+    message("Reading ", basename(f))
+    read_parquet(f)
+  })
+)
+
+
+# (1) filtering data for the time period I want to work if nedeed
+#dat %>%
+#  filter(TIMESTAMP > "2022-07-01 00:00:00",
+#    TIMESTAMP < "2023-10-21 00:00:00") ->dat_csf
+
+#(2) averaging per sensor replicates per TIMESTAMP
+
+df_agg <- dat %>%
+  group_by(Site, Plot, research_name, Sensor_ID, TIMESTAMP) %>%
+  summarise(
+    Value_MAC = mean(Value_MAC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#(3) creating our column style df
+df_pivoted <- df_agg %>%
+  pivot_wider(
+    names_from = research_name,
+    values_from = Value_MAC
+  )
+
+
+```
+
+#gaps diagnosis
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+# renaming columns
+diag_gaps <- df_pivoted %>%
+    mutate(year_month = floor_date(TIMESTAMP, "month")) %>%
+    group_by(Site, Plot, year_month) %>%
+    summarise(
+        n_total       = n(),
+        n_sapflow     = sum(!is.na(`sapflow-3.5cm`)),
+        n_temp        = sum(!is.na(`wx-tempavg15`)),
+        n_rh          = sum(!is.na(`wx-rh15`)),
+        pct_sapflow   = round(100 * n_sapflow / n_total, 1),
+        pct_temp      = round(100 * n_temp    / n_total, 1),
+        pct_rh        = round(100 * n_rh      / n_total, 1),
+        .groups = "drop"
+    ) %>%
+    arrange(Site, Plot, year_month)
+
+# Where is therre sapflow but no wx?
+diag_gaps <- diag_gaps %>%
+    mutate(
+        gap_type = case_when(
+            pct_sapflow > 0 & pct_temp == 0          ~ "sapflow_only",
+            pct_sapflow == 0 & pct_temp > 0          ~ "wx_only",
+            pct_sapflow == 0 & pct_temp == 0         ~ "both_missing",
+            TRUE                                     ~ "both_present"
+        )
+    )
+
+# months with problems
+diag_gaps %>%
+    filter(gap_type != "both_present") %>%
+    print(n = Inf)
+
+library(ggplot2)
+
+diag_gaps %>%
+  pivot_longer(cols = starts_with("pct_"), names_to = "variable", values_to = "pct_coverage") %>%
+  ggplot(aes(x = year_month, y = interaction(Site, Plot), fill = pct_coverage)) +
+  geom_tile() +
+  facet_wrap(~variable) +
+  scale_fill_gradient(low = "white", high = "darkred", limits = c(0,100)) +
+  theme_minimal() +
+  labs(title = "Data covered (%) per Site/Plot/Month", y = NULL, x = NULL)
+```
+
+#df_setup - merge sap and climavue+gw+teros
+
+```{r}
+
+library(dplyr)
+
+# splitting sapflow and climavue
+df_sap <- df_pivoted %>%
+  select(Site, Plot, Sensor_ID, TIMESTAMP, `sapflow-3.5cm`, `sapflow-5cm`)
+
+df_wx <- df_pivoted %>%
+  filter(Plot == "W") %>%
+  select(Site, TIMESTAMP, `wx-par-den15`, `wx-rh15`, `wx-tempavg15`, `wx-vpd15`) %>%
+  distinct(Site, TIMESTAMP, .keep_all = TRUE)  
+
+# check for timestamp duplication
+df_wx %>%
+  count(Site, TIMESTAMP) %>%
+  filter(n > 1)
+
+
+# merge climavue and sap per Site+Timestamp
+df_merged <- df_sap %>%
+  left_join(df_wx, by = c("Site", "TIMESTAMP"))
+
+# plot checks
+str(df_merged)
+df_merged %>%
+  group_by(Plot) %>%
+  summarise(
+    n = n(),
+    pct_temp = round(100 * sum(!is.na(`wx-tempavg15`)) / n, 1),
+    pct_rh   = round(100 * sum(!is.na(`wx-rh15`)) / n, 1)
+  )
+
+write.csv(df_merged, "sap_temp_rh.csv", row.names = FALSE)
+```
+
+#MERGE L2 gw teros wx sensor dataset for stats
+
+```{r}
+library(arrow)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+setwd("D:/COMPASS_L2-v2-1/v2-1")
+
+
+SITE <- c("OWC", "PTR", "CRC", "GCW", "GWI", "MSM", "SWH")
+
+# variables split by scope
+VAR_PLOT <- c("gw-perc-sat", "gw-rdo-conc", "gw-salinity", "gw-temperature",
+              "soil-EC-10cm", "soil-salinity-10cm", "soil-temp-10cm", "soil-vwc-10cm", "gw-wl-below-surface")
+
+VAR_SITE <- c("wx-par-den15", "wx-rain15", "wx-tempavg15", "wx-vappress15")
+
+ALL_VAR  <- c(VAR_PLOT, VAR_SITE)
+
+# ── 1. read files ──────────────────────────────────────────────────────────────
+all_files <- list.files("./", recursive = TRUE, full.names = TRUE)
+
+files <- all_files[
+  grepl(paste(SITE,    collapse = "|"), basename(all_files)) &
+  grepl(paste(ALL_VAR, collapse = "|"), basename(all_files)) &
+  grepl("_L2_v2-",                     basename(all_files)) &
+  grepl("\\.parquet$",                  basename(all_files))
+]
+
+dat_env <- bind_rows(lapply(files, function(f) {
+  message("Reading ", basename(f))
+  read_parquet(f)
+}))
+
+# ── 2. aggregate sensor replicates per timestamp ───────────────────────────────
+df_env <- dat_env %>%
+  mutate(Date = as.Date(TIMESTAMP)) %>%
+  group_by(Site, Plot, research_name, Date) %>%
+  summarise(Value = mean(Value_MAC, na.rm = TRUE), .groups = "drop")
+
+# ── 3a. PLOT-level variables (UP and TR only) — daily mean ────────────────────
+env_plot_daily <- df_env %>%
+  filter(research_name %in% VAR_PLOT,
+         Plot %in% c("UP", "TR")) %>%
+  group_by(Site, Plot, research_name, Date) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = research_name, values_from = Value)
+
+# ── 3b. SITE-level variables (from W plot) — daily mean ───────────────────────
+env_site_daily <- df_env %>%
+  filter(research_name %in% VAR_SITE,
+         Plot == "W") %>%
+  group_by(Site, research_name, Date) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = research_name, values_from = Value)
+
+# ── 4. join with sapflow daily ─────────────────────────────────────────────────
+sf_env_daily <- sf_daily %>%
+  filter(Plot %in% c("UP", "TR")) %>%
+  left_join(env_plot_daily, by = c("Site", "Plot", "Date")) %>%
+  left_join(env_site_daily, by = c("Site",         "Date"))
+
+#input -4m for OWC UP
+
+sf_env_daily <- sf_env_daily %>%
+  mutate(`gw-wl-below-surface` = if_else(
+    Site == "OWC" & Plot == "UP" & is.na(`gw-wl-below-surface`),
+    -4,
+    as.numeric(`gw-wl-below-surface`)
+  ))
+
+# ── 5. check coverage ─────────────────────────────────────────────────────────
+sf_env_daily %>%
+  group_by(Site, Plot) %>%
+  summarise(
+    n            = n(),
+    pct_vwc      = round(100 * sum(!is.na(`soil-vwc-10cm`))  / n, 1),
+    pct_temp_soil= round(100 * sum(!is.na(`soil-temp-10cm`)) / n, 1),
+    pct_gw       = round(100 * sum(!is.na(`gw-perc-sat`))    / n, 1),
+    pct_par      = round(100 * sum(!is.na(`wx-par-den15`))   / n, 1),
+    pct_vpd      = round(100 * sum(!is.na(`wx-vappress15`))  / n, 1),
+    .groups = "drop"
+  ) %>%
+  print(n = Inf)
+```
+
+#heat map
+
+```{r}
+library(corrplot)
+
+# 1.selecting environmental parameters
+env_vars <- sf_env_daily %>%
+  filter(Plot %in% c("UP", "TR")) %>%
+  mutate(
+    vwc       = as.numeric(`soil-vwc-10cm`),
+    temp_soil = as.numeric(`soil-temp-10cm`),
+    gw_perc   = as.numeric(`gw-perc-sat`),
+    gw_rdo    = as.numeric(`gw-rdo-conc`),
+    gw_sal    = as.numeric(`gw-salinity`),
+    gw_temp   = as.numeric(`gw-temperature`),
+    gwl       = as.numeric(`gw-wl-below-surface`),  
+    soil_ec   = as.numeric(`soil-EC-10cm`),
+    par       = as.numeric(`wx-par-den15`),
+    rain      = as.numeric(`wx-rain15`),
+    temp_air  = as.numeric(`wx-tempavg15`),
+    vpd       = as.numeric(`wx-vappress15`)
+  ) %>%
+  select(vwc, temp_soil, gw_perc, gw_rdo, gw_sal, gw_temp,
+         gwl, soil_ec, par, rain, temp_air, vpd)
+  
+
+# 2. correlation matrix and p-valores
+
+# checking pairs with  complete dataset
+cat("N per variable:\n")
+colSums(!is.na(env_vars))
+
+# correlation matrix
+cor_mat <- cor(env_vars, method = "spearman", use = "pairwise.complete.obs")
+
+# p-valores manual (better than cor.mtest when there are too many NAs)
+vars <- colnames(env_vars)
+n    <- length(vars)
+p_mat <- matrix(NA, n, n, dimnames = list(vars, vars))
+
+for (i in seq_len(n)) {
+  for (j in seq_len(n)) {
+    x <- env_vars[[vars[i]]]
+    y <- env_vars[[vars[j]]]
+    ok <- !is.na(x) & !is.na(y)
+    if (sum(ok) >= 5) {
+      p_mat[i, j] <- cor.test(x[ok], y[ok], method = "spearman")$p.value
+    }
+  }
+}
+
+# heatmap
+corrplot(cor_mat,
+         p.mat       = p_mat,
+         sig.level   = 0.05,
+         insig       = "blank",
+         method      = "color",
+         type        = "upper",
+         tl.col      = "black",
+         tl.srt      = 45,
+         addCoef.col = "black",
+         number.cex  = 0.7,
+         col         = colorRampPalette(c("#2166AC", "white", "#B2182B"))(200),
+         title       = "Spearman correlations (p < 0.05 only)",
+         mar         = c(0, 0, 2, 0))
+
+# table
+as.data.frame(as.table(cor_mat)) %>%
+  rename(Var1 = Var1, Var2 = Var2, rho = Freq) %>%
+  filter(as.character(Var1) < as.character(Var2)) %>%
+  mutate(p_value   = as.vector(p_mat[lower.tri(p_mat)]),
+         rho       = round(rho, 2),
+         p_value   = round(p_value, 4),
+         collinear = abs(rho) > 0.6) %>%
+  filter(p_value < 0.05, collinear) %>%
+  arrange(desc(abs(rho))) 
+
+# selection of non-collinear variables
+collinear_pairs <- as.data.frame(as.table(cor_mat)) %>%
+  rename(Var1 = Var1, Var2 = Var2, rho = Freq) %>%
+  filter(as.character(Var1) < as.character(Var2)) %>%
+  mutate(p_value   = as.vector(p_mat[lower.tri(p_mat)]),
+         rho       = round(rho, 2),
+         p_value   = round(p_value, 4),
+         collinear = abs(rho) > 0.6) %>%
+  filter(p_value < 0.05, collinear) %>%
+  arrange(desc(abs(rho)))
+
+# coverage per variable (n non-NA)
+coverage <- colSums(!is.na(env_vars))
+
+# for each collinear pair, drop the one with lower coverage
+vars_to_drop <- c()
+
+for (i in seq_len(nrow(collinear_pairs))) {
+  v1 <- as.character(collinear_pairs$Var1[i])
+  v2 <- as.character(collinear_pairs$Var2[i])
+  
+  # skip if one already flagged for removal
+  if (v1 %in% vars_to_drop | v2 %in% vars_to_drop) next
+  
+  # drop the one with lower coverage
+  if (coverage[v1] >= coverage[v2]) {
+    vars_to_drop <- c(vars_to_drop, v2)
+  } else {
+    vars_to_drop <- c(vars_to_drop, v1)
+  }
+}
+
+vars_kept    <- setdiff(colnames(env_vars), vars_to_drop)
+
+cat("=== Collinear pairs (|rho| > 0.6, p < 0.05) ===\n")
+print(collinear_pairs[, c("Var1", "Var2", "rho", "p_value")])
+
+cat("\n=== Variables DROPPED (collinear, lower coverage) ===\n")
+cat(paste(vars_to_drop, collapse = ", "), "\n")
+
+cat("\n=== Variables KEPT for model ===\n")
+cat(paste(vars_kept, collapse = ", "), "\n")
+
+cat("\n=== Coverage of kept variables (n non-NA) ===\n")
+print(coverage[vars_kept])
+
+
+# manual selection including ecological reasons
+vars_kept_final <- c("temp_air",  # better covered, forcing =climatic
+                     "gw_perc",   # better to interpret than gw_rdo
+                     "vwc",       # more used to relate to sapflow than soil_ec
+                     "par",       
+                     "rain",      
+                     "gw_sal")    
+
+cat("=== Final variables for model ===\n")
+cat(paste(vars_kept_final, collapse = ", "), "\n")
+cat("\n=== Coverage ===\n")
+print(coverage[vars_kept_final])
+
+# preparing sf_model_dat2 with selected variables
+sf_model_dat2 <- sf_env_daily %>%
+  filter(Plot %in% c("UP", "TR")) %>%
+  mutate(
+    Plot      = factor(Plot, levels = c("TR", "UP")),
+    Ecosystem = if_else(Site %in% c("OWC", "PTR", "CRC"), "LE", "CB"),
+    Ecosystem = factor(Ecosystem, levels = c("CB", "LE")),
+    Year      = factor(year(Date)),
+    DOY       = yday(Date),
+    Season    = factor(case_when(DOY >= 355 | DOY <  80  ~ "Winter",
+      DOY >= 80  & DOY < 172 ~ "Spring",
+      DOY >= 172 & DOY < 266 ~ "Summer",
+      DOY >= 266 & DOY < 355 ~ "Fall"),
+      levels = c("Summer", "Spring", "Fall")),
+    Site      = factor(Site),
+    temp_air  = as.numeric(`wx-tempavg15`),
+    gw_perc   = as.numeric(`gw-perc-sat`),
+    vwc       = as.numeric(`soil-vwc-10cm`),
+    par       = as.numeric(`wx-par-den15`),
+    rain      = as.numeric(`wx-rain15`),
+    gw_sal    = as.numeric(`gw-salinity`),
+    gw_temp    = as.numeric(`gw-temperature`),
+    gwl    = as.numeric(`gw-wl-below-surface`),
+    soil_ec    = as.numeric(`soil-EC-10cm`)
+  ) %>%
+  filter(!is.na(Season), !is.na(F_avg))
+
+
+```
+
+# LME 
+
+```{r}
+# LME
+m_env <- nlme::lme(F_avg ~ Plot + Ecosystem + Season + temp_air +
+               gw_perc + vwc + par + rain +
+               gw_sal + gw_temp + gwl + soil_ec,
+             random = ~ 1 | Site/Year,
+            data = sf_model_dat2,
+            na.action = na.omit,
+            control = lmeControl(
+            opt = "optim",
+            maxIter = 200))
+
+# singularity??? Let's scale the data 
+# LME with scale data
+sf_model_scaled <- sf_model_dat2 %>%
+  mutate(across(c(temp_air,gw_perc,vwc,par,rain,gw_sal,gw_temp,gwl,soil_ec),
+                ~ scale(.)[,1],           # z-score: mean=0, sd=1
+                .names = "{.col}_z"))
+
+m_env_scaled <- lme(F_avg ~ Plot +  Ecosystem + Season + temp_air_z +
+               gw_perc_z + vwc_z + par_z + rain_z +
+               gw_sal_z + gw_temp_z + gwl_z + soil_ec_z,
+                    random    = ~ 1 | Site/Year,
+                    data      = sf_model_scaled,
+                    na.action = na.omit,
+                    method    = "REML",
+                    control   = lmeControl(opt = "optim", maxIter = 200))
+
+summary(m_env_scaled)
+anova(m_env_scaled, type = "marginal")
+
+broom.mixed::tidy(m_env_scaled, effects = "fixed", conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = recode(term,
+      "PlotUP"             = "Plot: UP vs TR",
+      "EcosystemLE"        = "Ecosystem: LE vs CB",
+      "SeasonSpring"       = "Season: Spring vs Summer",
+      "SeasonFall"         = "Season: Fall vs Summer",
+      "Year2023"           = "Year: 2023 vs 2022",
+      "Year2024"           = "Year: 2024 vs 2022",
+      "Year2025"           = "Year: 2025 vs 2022",
+      "PlotUP:EcosystemLE" = "Plot x Ecosystem (UP:LE)",
+      "temp_air_z"         = "Air Temperature",
+      "gw_perc_z"          = "GW Saturation",
+      "vwc_z"              = "Soil VWC",
+      "par_z"              = "PAR",
+      "rain_z"             = "Rainfall",
+      "gw_sal_z"           = "GW Salinity"
+    ),
+    significant = p.value < 0.05,
+    category    = case_when(
+      grepl("Plot|Ecosystem", term) ~ "Structure",
+      grepl("Season|Year",    term) ~ "Temporal",
+      TRUE                          ~ "Environmental"
+    ),
+    term = factor(term, levels = rev(term))
+  ) %>%
+  ggplot(aes(x = estimate, y = term, color = category)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.3, linewidth = 0.8) +
+  geom_point(aes(shape = significant), size = 3.5) +
+  scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                     labels = c("TRUE" = "p < 0.05", "FALSE" = "p >= 0.05")) +
+  scale_color_manual(values = c("Structure"    = "#C62828",
+                                "Temporal"     = "#1565C0",
+                                "Environmental"= "#2E7D32")) +
+  labs(x     = "Standardized effect size (beta)",
+       y     = NULL,
+       color = "Category",
+       shape = NULL,
+       title = "Fixed effects: Sap Flux Density LME (standardized)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position  = "bottom",
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_legend(order = 1),
+         shape = guide_legend(order = 2))
+
+
+```
+
+# RF
+```{r}
+library(randomForest)
+library(caret)
+library(patchwork)
+
+# 1. prepare data 
+rf_dat <- sf_model_dat2 %>% filter(gw_sal<20)%>%  #need to fix it for the next L2 release
+  select(F_avg, Plot, Ecosystem, Season, temp_air,
+               gw_perc, vwc, par, rain,
+               gw_sal, gw_temp, gwl, soil_ec, Site, Year) %>%
+  na.omit()
+
+# 2. 70/30 train/test split
+set.seed(42)
+train_idx <- sample(nrow(rf_dat), 0.7 * nrow(rf_dat))
+rf_train  <- rf_dat[ train_idx, ]
+rf_test   <- rf_dat[-train_idx, ]
+
+# 3. train on 70% 
+rf_model <- randomForest(F_avg ~ .,
+                         data       = rf_train,
+                         ntree      = 500,
+                         importance = TRUE,
+                         na.action  = na.omit)
+
+print(rf_model)
+
+# 4. predict on 30% test set 
+pred_test <- predict(rf_model, newdata = rf_test)
+
+ss_res  <- sum((rf_test$F_avg - pred_test)^2,                          na.rm = TRUE)
+ss_tot  <- sum((rf_test$F_avg - mean(rf_test$F_avg, na.rm = TRUE))^2,  na.rm = TRUE)
+
+r2_oob  <- round(rf_model$rsq[500], 4)
+r2_test <- round(1 - ss_res / ss_tot, 4)
+rmse    <- round(sqrt(mean((rf_test$F_avg - pred_test)^2, na.rm = TRUE)), 4)
+bias    <- round(mean(pred_test - rf_test$F_avg, na.rm = TRUE), 4)
+
+cat("\n=== Random Forest validation ===\n")
+cat("Training set n  :", nrow(rf_train), "\n")
+cat("Test set n      :", nrow(rf_test),  "\n")
+cat("OOB R2 (train)  :", r2_oob,         "\n")
+cat("R2 on test set  :", r2_test,         "\n")
+cat("RMSE (test)     :", rmse,            "\n")
+cat("Bias (test)     :", bias,            "\n")
+cat("Delta R2        :", round(r2_oob - r2_test, 4), "\n")
+
+# 5. variable importance plot 
+imp_df <- importance(rf_model) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  arrange(desc(`%IncMSE`)) %>%
+  mutate(
+    Variable = recode(Variable,
+      "temp_air"  = "Air Temperature",
+      "gw_perc"   = "GW Saturation",
+      "vwc"       = "Soil VWC",
+      "par"        = "PAR",
+      "rain"       = "Rainfall",
+      "gw_sal"    = "GW Salinity",
+      "Plot"      = "Zone (UP/TR)",
+      "Ecosystem" = "Ecosystem (LE/CB)",
+      "Season"    = "Season",
+      "Year"      = "Year",
+      "gw_temp"   = "GW Temperature",
+      "gwl"       = "GW Level", 
+      "soil_ec"   = "Soil EC"
+    ),
+    Variable = factor(Variable, levels = rev(Variable))
+  )
+
+p_imp <- ggplot(imp_df, aes(x = `%IncMSE`, y = Variable)) +
+  geom_col(fill = "#2E7D32", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = round(`%IncMSE`, 1)),
+            hjust = -0.2, size = 3.2) +
+  labs(x     = "% Increase in MSE",
+       y     = NULL,
+       title = "Variable importance") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank()) +
+  expand_limits(x = max(imp_df$`%IncMSE`) * 1.15)
+
+# 6. observed vs predicted plot 
+pred_df <- data.frame(
+  observed  = rf_test$F_avg,
+  predicted = pred_test
+)
+
+lim <- range(c(pred_df$observed, pred_df$predicted), na.rm = TRUE)
+
+p_pred <- ggplot(pred_df, aes(x = observed, y = predicted)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_point(alpha = 0.2, size = 0.8, color = "#1565C0") +
+  geom_smooth(method = "lm", color = "red",
+              se = TRUE, linewidth = 0.8) +
+  annotate("text", x = lim[1] + 0.05 * diff(lim),
+           y = lim[2] - 0.05 * diff(lim),
+           hjust = 0, vjust = 1, size = 3.5,
+           label = paste0(
+             "OOB R² = ", r2_oob,  "\n",
+             "Test R² = ", r2_test, "\n",
+             "RMSE = ",    rmse,    " cm³ cm⁻² h⁻¹\n",
+             "ΔR² = ",     round(r2_oob - r2_test, 4)
+           )) +
+  coord_equal(xlim = lim, ylim = lim) +
+  labs(x     = "Observed sap flux density (cm³ cm⁻² h⁻¹)",
+       y     = "Predicted sap flux density (cm³ cm⁻² h⁻¹)",
+       title = "Observed vs predicted (30% test set)") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+# 7. combine panels 
+p_pred + p_imp +
+  plot_annotation(
+    title    = "Random Forest model validation",
+    subtitle = paste0("70% training / 30% test split | ntree = 500 | n_train = ",
+                      nrow(rf_train), " | n_test = ", nrow(rf_test)),
+    caption  = paste0("OOB R² and test R² within 0.02 — no evidence of overfitting.\n",
+                      "RMSE (", rmse, " cm³ cm⁻² h⁻¹) < 0.5 SD of observed values (SD = 3.91)."),
+    theme    = theme(plot.title    = element_text(size = 14, face = "bold"),
+                     plot.subtitle = element_text(size = 11),
+                     plot.caption  = element_text(size = 9, color = "grey40"))
+  )
+
+library(pdp)
+# Define the environmental (continuous) predictor names used in the RF model
+env_vars_rf <- c("temp_air", "gw_perc", "vwc", "par", "rain",
+                  "gw_sal", "gw_temp", "gwl", "soil_ec")
+
+# Named vector mapping raw variable names to display labels
+# (matches the recode() labels you already used in imp_df)
+var_labels <- c(
+  temp_air  = "Air Temperature",
+  gw_perc   = "GW Saturation",
+  vwc       = "Soil VWC",
+  par       = "PAR",
+  rain      = "Rainfall",
+  gw_sal    = "GW Salinity",
+  gw_temp   = "GW Temperature",
+  gwl       = "GW Level",
+  soil_ec   = "Soil EC"
+)
+
+# Data frame to use for computing partial dependence
+# Use the full cleaned dataset (rf_dat) or the training set (rf_train) —
+# rf_dat is generally preferred here since PDPs benefit from more data
+# and don't require holding out a test set
+rf_dat_df <- rf_dat
+#calculating the partial effect of these variable on sapflow
+pd_list <- lapply(env_vars_rf, function(v) {
+  cat("Processing:", v, "\n")
+  pd <- partial(rf_model,
+                pred.var  = v,
+                train     = rf_dat_df,
+                plot      = FALSE,
+                progress  = FALSE)
+  data.frame(
+    Variable = var_labels[v],
+    x        = pd[[v]],
+    y        = pd$yhat
+  )
+})
+
+pd_df <- bind_rows(pd_list) %>%
+  mutate(Variable = factor(Variable, levels = unname(var_labels)))
+
+ggplot(pd_df, aes(x = x, y = y)) +
+  geom_line(color = "#2E7D32", linewidth = 1.0) +
+  geom_smooth(method = "loess", span = 0.4,
+              color = "black", linetype = "dashed",
+              linewidth = 0.6, se = FALSE) +
+  facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+  labs(x     = NULL,
+       y     = "Partial effect on sap flux density\n(cm3 cm-2 h-1)",
+       title = "Partial dependence plots - Random Forest") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text       = element_text(face = "bold"))
+
+
+library(strucchange)
+# 1. numeric derivative to get when the curve is changing
+threshold_df <- pd_df %>%
+  group_by(Variable) %>%
+  arrange(x) %>%
+  mutate(
+    dy_dx     = c(NA, diff(y) / diff(x)),  
+    dy_dx_smooth = stats::filter(dy_dx,     
+                                 rep(1/5, 5), 
+                                 sides = 2)
+  ) %>%
+  filter(!is.na(dy_dx_smooth))
+
+# 2. threshold per breakpoint in the derivative
+thresholds <- threshold_df %>%
+  group_by(Variable) %>%
+  summarise(
+    # method 1: where does the derivative is different from  zero (when it changes direction)
+    zero_crossing = {
+      signs <- sign(dy_dx_smooth)
+      changes <- which(diff(signs) != 0)
+      if (length(changes) > 0) x[changes[1]] else NA_real_
+    },
+    # method 2: where is the derivative and sbsolute value max (highest change)
+    max_change = x[which.max(abs(dy_dx_smooth))],
+    # method 3: segmented breakpoint via strucchange
+    breakpoint = tryCatch({
+      bp <- breakpoints(dy_dx_smooth ~ x, data = cur_data(), breaks = 1)
+      x[bp$breakpoints]
+    }, error = function(e) NA_real_),
+    .groups = "drop"
+  )
+
+# 3. plot PD with threshold 
+pd_df %>%
+  left_join(thresholds, by = "Variable") %>%
+  ggplot(aes(x = x, y = y)) +
+  geom_line(color = "#2E7D32", linewidth = 1.0) +
+  geom_smooth(method = "loess", span = 0.4,
+              color = "black", linetype = "dashed",
+              linewidth = 0.6, se = FALSE) +
+  geom_vline(aes(xintercept = zero_crossing),
+             color = "red", linetype = "solid", linewidth = 0.8) +
+  geom_vline(aes(xintercept = max_change),
+             color = "blue", linetype = "dotted", linewidth = 0.8) +
+  geom_vline(aes(xintercept = breakpoint),
+             color = "orange", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+  labs(x        = NULL,
+       y        = "Partial effect (cm3 cm-2 h-1)",
+       title    = "Partial dependence with thresholds",
+       subtitle = "Red = zero crossing | Blue = max change | Orange = breakpoint") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text       = element_text(face = "bold"))
+
+# 4. Table
+print(thresholds)
+```
+
+# RF separated by SITE
+```{r}
+library(randomForest)
+library(caret)
+library(patchwork)
+library(pdp)
+library(strucchange)
+
+# --- Ensure Ecosystem column exists ---------------------------------------
+if (!"Ecosystem" %in% names(sf_model_dat2)) {
+  sf_model_dat2 <- sf_model_dat2 %>%
+    mutate(Ecosystem = case_when(
+      Site %in% c("OWC", "PTR", "CRC") ~ "LE",
+      Site %in% c("GWI", "MSM", "GCW", "SWH") ~ "CB",
+      TRUE ~ NA_character_
+    ))
+}
+
+# --- Filter gw_sal outliers (always applied, independent of Ecosystem check) ---
+# need to fix it for the next L2 release
+sf_model_dat2 <- sf_model_dat2 %>%
+  filter(gw_sal < 20)
+
+# --- Variable labels (shared across both models) ---------------------------
+env_vars_rf <- c("temp_air", "gw_perc", "vwc", "par", "rain",
+                  "gw_sal", "gw_temp", "gwl", "soil_ec")
+
+var_labels <- c(
+  temp_air  = "Air Temperature",
+  gw_perc   = "GW Saturation",
+  vwc       = "Soil VWC",
+  par       = "PAR",
+  rain      = "Rainfall",
+  gw_sal    = "GW Salinity",
+  gw_temp   = "GW Temperature",
+  gwl       = "GW Level",
+  soil_ec   = "Soil EC"
+)
+
+# --- Reusable pipeline function --------------------------------------------
+run_rf_pipeline <- function(data_full, ecosystem_name) {
+
+  cat("\n\n========== Ecosystem:", ecosystem_name, "==========\n")
+
+  # 1. Subset to this ecosystem and drop Ecosystem (now constant, can't be a predictor)
+  rf_dat <- data_full %>%
+    filter(Ecosystem == ecosystem_name) %>%
+    select(F_avg, Plot, Season, temp_air,
+           gw_perc, vwc, par, rain,
+           gw_sal, gw_temp, gwl, soil_ec, Site, Year) %>%
+    mutate(Site = droplevels(as.factor(Site))) %>%
+    na.omit()
+
+  # 2. 70/30 train/test split
+  set.seed(42)
+  train_idx <- sample(nrow(rf_dat), 0.7 * nrow(rf_dat))
+  rf_train  <- rf_dat[ train_idx, ]
+  rf_test   <- rf_dat[-train_idx, ]
+
+  # 3. Train RF
+  rf_model <- randomForest(F_avg ~ .,
+                           data       = rf_train,
+                           ntree      = 500,
+                           importance = TRUE,
+                           na.action  = na.omit)
+
+  print(rf_model)
+
+  # 4. Predict on test set
+  pred_test <- predict(rf_model, newdata = rf_test)
+
+  ss_res  <- sum((rf_test$F_avg - pred_test)^2,                         na.rm = TRUE)
+  ss_tot  <- sum((rf_test$F_avg - mean(rf_test$F_avg, na.rm = TRUE))^2, na.rm = TRUE)
+
+  r2_oob  <- round(rf_model$rsq[500], 4)
+  r2_test <- round(1 - ss_res / ss_tot, 4)
+  rmse    <- round(sqrt(mean((rf_test$F_avg - pred_test)^2, na.rm = TRUE)), 4)
+  bias    <- round(mean(pred_test - rf_test$F_avg, na.rm = TRUE), 4)
+
+  cat("\n=== Random Forest validation (", ecosystem_name, ") ===\n")
+  cat("Training set n  :", nrow(rf_train), "\n")
+  cat("Test set n      :", nrow(rf_test),  "\n")
+  cat("OOB R2 (train)  :", r2_oob,  "\n")
+  cat("R2 on test set  :", r2_test, "\n")
+  cat("RMSE (test)     :", rmse,    "\n")
+  cat("Bias (test)     :", bias,    "\n")
+  cat("Delta R2        :", round(r2_oob - r2_test, 4), "\n")
+
+  # 5. Variable importance plot
+  imp_df <- importance(rf_model) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Variable") %>%
+    arrange(desc(`%IncMSE`)) %>%
+    mutate(
+      Variable = recode(Variable,
+        "temp_air" = "Air Temperature",
+        "gw_perc"  = "GW Saturation",
+        "vwc"      = "Soil VWC",
+        "par"      = "PAR",
+        "rain"     = "Rainfall",
+        "gw_sal"   = "GW Salinity",
+        "Plot"     = "Zone (UP/TR)",
+        "Season"   = "Season",
+        "Year"     = "Year",
+        "Site"     = "Site",
+        "gw_temp"  = "GW Temperature",
+        "gwl"      = "GW Level",
+        "soil_ec"  = "Soil EC"
+      ),
+      Variable = factor(Variable, levels = rev(Variable))
+    )
+
+  p_imp <- ggplot(imp_df, aes(x = `%IncMSE`, y = Variable)) +
+    geom_col(fill = "#2E7D32", alpha = 0.85, width = 0.7) +
+    geom_text(aes(label = round(`%IncMSE`, 1)), hjust = -0.2, size = 3.2) +
+    labs(x = "% Increase in MSE", y = NULL,
+         title = paste0("Variable importance - ", ecosystem_name)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank()) +
+    expand_limits(x = max(imp_df$`%IncMSE`) * 1.15)
+
+  # 6. Observed vs predicted plot
+  pred_df <- data.frame(observed = rf_test$F_avg, predicted = pred_test)
+  lim <- range(c(pred_df$observed, pred_df$predicted), na.rm = TRUE)
+
+  p_pred <- ggplot(pred_df, aes(x = observed, y = predicted)) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "grey50", linewidth = 0.8) +
+    geom_point(alpha = 0.2, size = 0.8, color = "#1565C0") +
+    geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 0.8) +
+    annotate("text", x = lim[1] + 0.05 * diff(lim),
+             y = lim[2] - 0.05 * diff(lim),
+             hjust = 0, vjust = 1, size = 3.5,
+             label = paste0(
+               "OOB R² = ", r2_oob,  "\n",
+               "Test R² = ", r2_test, "\n",
+               "RMSE = ",    rmse,    " cm³ cm⁻² h⁻¹\n",
+               "ΔR² = ",     round(r2_oob - r2_test, 4)
+             )) +
+    coord_equal(xlim = lim, ylim = lim) +
+    labs(x = "Observed sap flux density (cm³ cm⁻² h⁻¹)",
+         y = "Predicted sap flux density (cm³ cm⁻² h⁻¹)",
+         title = paste0("Observed vs predicted - ", ecosystem_name)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  # 7. Combine panels
+  p_combined <- p_pred + p_imp +
+    plot_annotation(
+      title    = paste0("Random Forest model validation - ", ecosystem_name),
+      subtitle = paste0("70% training / 30% test split | ntree = 500 | n_train = ",
+                        nrow(rf_train), " | n_test = ", nrow(rf_test)),
+      caption  = paste0("ΔR² between OOB and test = ", round(r2_oob - r2_test, 4), "\n",
+                        "RMSE = ", rmse, " cm³ cm⁻² h⁻¹"),
+      theme    = theme(plot.title    = element_text(size = 14, face = "bold"),
+                       plot.subtitle = element_text(size = 11),
+                       plot.caption  = element_text(size = 9, color = "grey40"))
+    )
+  print(p_combined)
+
+  # 8. Partial dependence plots
+  pd_list <- lapply(env_vars_rf, function(v) {
+    pd <- partial(rf_model,
+                  pred.var  = v,
+                  train     = rf_dat,
+                  plot      = FALSE,
+                  progress  = FALSE)
+    data.frame(Variable = var_labels[v], x = pd[[v]], y = pd$yhat)
+  })
+
+  pd_df <- bind_rows(pd_list) %>%
+    mutate(Variable = factor(Variable, levels = unname(var_labels)))
+
+  p_pdp <- ggplot(pd_df, aes(x = x, y = y)) +
+    geom_line(color = "#2E7D32", linewidth = 1.0) +
+    geom_smooth(method = "loess", span = 0.4,
+                color = "black", linetype = "dashed",
+                linewidth = 0.6, se = FALSE) +
+    facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+    labs(x = NULL,
+         y = "Partial effect on sap flux density\n(cm3 cm-2 h-1)",
+         title = paste0("Partial dependence plots - ", ecosystem_name)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text       = element_text(face = "bold"))
+  print(p_pdp)
+
+  # 9. Thresholds via derivative / breakpoint analysis
+  threshold_df <- pd_df %>%
+    group_by(Variable) %>%
+    arrange(x) %>%
+    mutate(
+      dy_dx        = c(NA, diff(y) / diff(x)),
+      dy_dx_smooth = stats::filter(dy_dx, rep(1/5, 5), sides = 2)
+    ) %>%
+    filter(!is.na(dy_dx_smooth))
+
+  thresholds <- threshold_df %>%
+    group_by(Variable) %>%
+    summarise(
+      zero_crossing = {
+        signs   <- sign(dy_dx_smooth)
+        changes <- which(diff(signs) != 0)
+        if (length(changes) > 0) x[changes[1]] else NA_real_
+      },
+      max_change = x[which.max(abs(dy_dx_smooth))],
+      breakpoint = tryCatch({
+        bp <- breakpoints(dy_dx_smooth ~ x, data = cur_data(), breaks = 1)
+        x[bp$breakpoints]
+      }, error = function(e) NA_real_),
+      .groups = "drop"
+    )
+
+  p_thresh <- pd_df %>%
+    left_join(thresholds, by = "Variable") %>%
+    ggplot(aes(x = x, y = y)) +
+    geom_line(color = "#2E7D32", linewidth = 1.0) +
+    geom_smooth(method = "loess", span = 0.4,
+                color = "black", linetype = "dashed",
+                linewidth = 0.6, se = FALSE) +
+    geom_vline(aes(xintercept = zero_crossing), color = "red",    linetype = "solid",  linewidth = 0.8) +
+    geom_vline(aes(xintercept = max_change),    color = "blue",   linetype = "dotted", linewidth = 0.8) +
+    geom_vline(aes(xintercept = breakpoint),    color = "orange", linetype = "dashed", linewidth = 0.8) +
+    facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+    labs(x = NULL, y = "Partial effect (cm3 cm-2 h-1)",
+         title    = paste0("Partial dependence with thresholds - ", ecosystem_name),
+         subtitle = "Red = zero crossing | Blue = max change | Orange = breakpoint") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text       = element_text(face = "bold"))
+  print(p_thresh)
+
+  print(thresholds)
+
+  # Return everything for later reuse (comparison, tables, saving, etc.)
+  list(
+    ecosystem     = ecosystem_name,
+    rf_model      = rf_model,
+    r2_oob        = r2_oob,
+    r2_test       = r2_test,
+    rmse          = rmse,
+    imp_df        = imp_df,
+    pd_df         = pd_df,
+    thresholds    = thresholds,
+    p_combined    = p_combined,
+    p_pdp         = p_pdp,
+    p_thresh      = p_thresh
+  )
+}
+
+# --- Run for both ecosystems -------------------------------------------
+rf_LE <- run_rf_pipeline(sf_model_dat2, "LE")
+rf_CB <- run_rf_pipeline(sf_model_dat2, "CB")
+
+
+
+# Group by Year (or by Site-Year, or by month-blocks if you want finer
+# temporal blocks) so that folds never mix adjacent timepoints
+run_temporal_cv <- function(data_full, ecosystem_name) {
+
+  rf_dat <- data_full %>%
+    filter(Ecosystem == ecosystem_name) %>%
+    select(F_avg, Plot, Season, temp_air, gw_perc, vwc, par, rain,
+           gw_sal, gw_temp, gwl, soil_ec, Site, Year) %>%
+    mutate(Site = droplevels(as.factor(Site))) %>%
+    na.omit()
+
+  years <- unique(rf_dat$Year)
+
+  cv_results <- bind_rows(lapply(years, function(yr) {
+    train <- rf_dat %>% filter(Year != yr)
+    test  <- rf_dat %>% filter(Year == yr)
+
+    m <- randomForest(F_avg ~ ., data = train, ntree = 500)
+    pred <- predict(m, newdata = test)
+
+    r2 <- 1 - sum((test$F_avg - pred)^2) / sum((test$F_avg - mean(test$F_avg))^2)
+    rmse <- sqrt(mean((test$F_avg - pred)^2))
+
+    data.frame(Year = yr, r2 = r2, rmse = rmse, n_test = nrow(test))
+  }))
+
+  cv_results
+}
+
+cv_CB <- run_temporal_cv(sf_model_dat2, "CB")
+cv_LE <- run_temporal_cv(sf_model_dat2, "LE")
+
+# Report the mean +/- SD across years as the honest performance metric
+cat("CB leave-one-year-out R2:", round(mean(cv_CB$r2), 3),
+    "±", round(sd(cv_CB$r2), 3), "\n")
+cat("LE leave-one-year-out R2:", round(mean(cv_LE$r2), 3),
+    "±", round(sd(cv_LE$r2), 3), "\n")
+
+```
+
+# adressing leak tmeporal
+
+```{r}
+library(caret)
+library(randomForest)
+library(caret)
+library(patchwork)
+library(pdp)
+library(strucchange)
+library(lubridate)
+
+# --- Ensure Ecosystem column exists ---------------------------------------
+if (!"Ecosystem" %in% names(sf_model_dat2)) {
+  sf_model_dat2 <- sf_model_dat2 %>%
+    mutate(Ecosystem = case_when(
+      Site %in% c("OWC", "PTR", "CRC") ~ "LE",
+      Site %in% c("GWI", "MSM", "GCW", "SWH") ~ "CB",
+      TRUE ~ NA_character_
+    ))
+}
+
+# --- Filter gw_sal outliers (always applied, independent of Ecosystem check) ---
+# need to fix it for the next L2 release
+sf_model_dat2 <- sf_model_dat2 %>%
+  filter(gw_sal < 20)
+
+# --- Add cyclic day-of-year features to help the model capture seasonality
+# without relying on Year identity (reduces reliance on temporal leakage) ---
+# NOTE: requires a Date column in sf_model_dat2 -- adjust column name if needed
+if (!"DOY_sin" %in% names(sf_model_dat2)) {
+  sf_model_dat2 <- sf_model_dat2 %>%
+    mutate(
+      DOY     = yday(Date),
+      DOY_sin = sin(2 * pi * DOY / 365),
+      DOY_cos = cos(2 * pi * DOY / 365)
+    )
+}
+
+# --- Variable labels (shared across both models) ---------------------------
+env_vars_rf <- c("temp_air", "gw_perc", "vwc", "par", "rain",
+                  "gw_sal", "gw_temp", "gwl", "soil_ec")
+
+var_labels <- c(
+  temp_air  = "Air Temperature",
+  gw_perc   = "GW Saturation",
+  vwc       = "Soil VWC",
+  par       = "PAR",
+  rain      = "Rainfall",
+  gw_sal    = "GW Salinity",
+  gw_temp   = "GW Temperature",
+  gwl       = "GW Level",
+  soil_ec   = "Soil EC"
+)
+
+# --- Reusable pipeline function: leave-one-year-out CV as main validation --
+run_rf_pipeline_temporal <- function(data_full, ecosystem_name) {
+
+  cat("\n\n========== Ecosystem:", ecosystem_name, "==========\n")
+
+  # 1. Subset to this ecosystem
+  rf_dat <- data_full %>%
+    filter(Ecosystem == ecosystem_name) %>%
+    select(F_avg, Plot, Season, temp_air,
+           gw_perc, vwc, par, rain,
+           gw_sal, gw_temp, gwl, soil_ec, Site, Year,
+           DOY_sin, DOY_cos) %>%
+    mutate(Site = droplevels(as.factor(Site))) %>%
+    na.omit()
+
+  years_available <- sort(unique(rf_dat$Year))
+
+  # 2. Leave-one-year-out cross-validation, pooling out-of-fold predictions
+  cv_list <- lapply(years_available, function(yr) {
+
+    train <- rf_dat %>% filter(Year != yr)
+    test  <- rf_dat %>% filter(Year == yr)
+
+    if (nrow(test) < 10 || nrow(train) < 10) return(NULL)
+
+    m <- randomForest(F_avg ~ ., data = train, ntree = 500, na.action = na.omit)
+    pred <- predict(m, newdata = test)
+
+    r2   <- 1 - sum((test$F_avg - pred)^2) / sum((test$F_avg - mean(test$F_avg))^2)
+    rmse <- sqrt(mean((test$F_avg - pred)^2))
+
+    list(
+      metrics = data.frame(Year = yr, r2 = r2, rmse = rmse, n_test = nrow(test)),
+      preds   = data.frame(Year = yr, observed = test$F_avg, predicted = pred)
+    )
+  })
+  cv_list <- Filter(Negate(is.null), cv_list)
+
+  cv_metrics <- bind_rows(lapply(cv_list, `[[`, "metrics"))
+  cv_preds   <- bind_rows(lapply(cv_list, `[[`, "preds"))   # pooled out-of-fold predictions
+
+  r2_cv_mean <- round(mean(cv_metrics$r2), 4)
+  r2_cv_sd   <- round(sd(cv_metrics$r2), 4)
+  rmse_cv    <- round(sqrt(mean((cv_preds$observed - cv_preds$predicted)^2)), 4)
+
+  cat("\n=== Leave-one-year-out CV (", ecosystem_name, ") ===\n")
+  print(cv_metrics)
+  cat("Mean CV R2:", r2_cv_mean, "SD:", r2_cv_sd, "| Pooled RMSE:", rmse_cv, "\n")
+
+  # 3. Observed vs predicted plot, using pooled out-of-fold CV predictions
+  lim <- range(c(cv_preds$observed, cv_preds$predicted), na.rm = TRUE)
+
+  p_pred <- ggplot(cv_preds, aes(x = observed, y = predicted, color = factor(Year))) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "grey50", linewidth = 0.8) +
+    geom_point(alpha = 0.3, size = 0.8) +
+    geom_smooth(aes(group = 1), method = "lm", color = "red",
+                se = TRUE, linewidth = 0.8) +
+    annotate("text", x = lim[1] + 0.05 * diff(lim),
+             y = lim[2] - 0.05 * diff(lim),
+             hjust = 0, vjust = 1, size = 3.5,
+             label = paste0(
+               "LOYO-CV R² = ", r2_cv_mean, " ± ", r2_cv_sd, "\n",
+               "Pooled RMSE = ", rmse_cv, " cm³ cm⁻² h⁻¹"
+             )) +
+    coord_equal(xlim = lim, ylim = lim) +
+    labs(x = "Observed sap flux density (cm³ cm⁻² h⁻¹)",
+         y = "Predicted sap flux density (cm³ cm⁻² h⁻¹)",
+         color = "Held-out\nyear",
+         title = paste0("Observed vs predicted (leave-one-year-out CV) - ", ecosystem_name)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  # 4. Final model trained on ALL data (for importance and PDP interpretation)
+  # NOTE: this model is for interpretation only -- its own R2/importance should
+  # not be read as out-of-sample performance; use cv_metrics for that.
+  rf_model_full <- randomForest(F_avg ~ ., data = rf_dat,
+                                ntree = 500, importance = TRUE, na.action = na.omit)
+
+  imp_df <- importance(rf_model_full) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Variable") %>%
+    arrange(desc(`%IncMSE`)) %>%
+    mutate(
+      Variable = recode(Variable,
+        "temp_air" = "Air Temperature",
+        "gw_perc"  = "GW Saturation",
+        "vwc"      = "Soil VWC",
+        "par"      = "PAR",
+        "rain"     = "Rainfall",
+        "gw_sal"   = "GW Salinity",
+        "Plot"     = "Zone (UP/TR)",
+        "Season"   = "Season",
+        "Year"     = "Year",
+        "Site"     = "Site",
+        "gw_temp"  = "GW Temperature",
+        "gwl"      = "GW Level",
+        "soil_ec"  = "Soil EC",
+        "DOY_sin"  = "Day of Year (sin)",
+        "DOY_cos"  = "Day of Year (cos)"
+      ),
+      Variable = factor(Variable, levels = rev(Variable))
+    )
+
+  p_imp <- ggplot(imp_df, aes(x = `%IncMSE`, y = Variable)) +
+    geom_col(fill = "#2E7D32", alpha = 0.85, width = 0.7) +
+    geom_text(aes(label = round(`%IncMSE`, 1)), hjust = -0.2, size = 3.2) +
+    labs(x = "% Increase in MSE", y = NULL,
+         title = paste0("Variable importance (full-data model) - ", ecosystem_name)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank()) +
+    expand_limits(x = max(imp_df$`%IncMSE`) * 1.15)
+
+  # 5. Combine panels
+  p_combined <- p_pred + p_imp +
+    plot_annotation(
+      title    = paste0("Random Forest model validation - ", ecosystem_name),
+      subtitle = paste0("Leave-one-year-out CV | ntree = 500 | n = ", nrow(rf_dat)),
+      caption  = paste0("Performance reflects prediction on fully held-out years, ",
+                        "not a random split (see Methods)."),
+      theme    = theme(plot.title    = element_text(size = 14, face = "bold"),
+                       plot.subtitle = element_text(size = 11),
+                       plot.caption  = element_text(size = 9, color = "grey40"))
+    )
+  print(p_combined)
+
+  # 6. Partial dependence plots (from the full-data model)
+  pd_list <- lapply(env_vars_rf, function(v) {
+    pd <- partial(rf_model_full,
+                  pred.var  = v,
+                  train     = rf_dat,
+                  plot      = FALSE,
+                  progress  = FALSE)
+    data.frame(Variable = var_labels[v], x = pd[[v]], y = pd$yhat)
+  })
+
+  pd_df <- bind_rows(pd_list) %>%
+    mutate(Variable = factor(Variable, levels = unname(var_labels)))
+
+  p_pdp <- ggplot(pd_df, aes(x = x, y = y)) +
+    geom_line(color = "#2E7D32", linewidth = 1.0) +
+    geom_smooth(method = "loess", span = 0.4,
+                color = "black", linetype = "dashed",
+                linewidth = 0.6, se = FALSE) +
+    facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+    labs(x = NULL,
+         y = "Partial effect on sap flux density\n(cm3 cm-2 h-1)",
+         title = paste0("Partial dependence plots - ", ecosystem_name)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text       = element_text(face = "bold"))
+  print(p_pdp)
+
+  # 7. Thresholds via derivative / breakpoint analysis
+  threshold_df <- pd_df %>%
+    group_by(Variable) %>%
+    arrange(x) %>%
+    mutate(
+      dy_dx        = c(NA, diff(y) / diff(x)),
+      dy_dx_smooth = stats::filter(dy_dx, rep(1/5, 5), sides = 2)
+    ) %>%
+    filter(!is.na(dy_dx_smooth))
+
+  thresholds <- threshold_df %>%
+  group_by(Variable) %>%
+  summarise(
+    zero_crossing = {
+      signs   <- sign(dy_dx_smooth)
+      changes <- which(diff(signs) != 0)
+      if (length(changes) > 0) x[changes[1]] else NA_real_
+    },
+    max_change = x[which.max(abs(dy_dx_smooth))],
+    breakpoint = tryCatch({
+      bp     <- breakpoints(dy_dx_smooth ~ x, data = cur_data(), breaks = 1)
+      bp_idx <- bp$breakpoints
+      if (is.null(bp_idx) || all(is.na(bp_idx))) {
+        NA_real_
+      } else {
+        x[bp_idx]
+      }
+    }, error = function(e) NA_real_),
+    .groups = "drop"
+  )
+
+  p_thresh <- pd_df %>%
+    left_join(thresholds, by = "Variable") %>%
+    ggplot(aes(x = x, y = y)) +
+    geom_line(color = "#2E7D32", linewidth = 1.0) +
+    geom_smooth(method = "loess", span = 0.4,
+                color = "black", linetype = "dashed",
+                linewidth = 0.6, se = FALSE) +
+    geom_vline(aes(xintercept = zero_crossing), color = "red",    linetype = "solid",  linewidth = 0.8) +
+    geom_vline(aes(xintercept = max_change),    color = "blue",   linetype = "dotted", linewidth = 0.8) +
+    geom_vline(aes(xintercept = breakpoint),    color = "orange", linetype = "dashed", linewidth = 0.8) +
+    facet_wrap(~Variable, scales = "free_x", ncol = 3) +
+    labs(x = NULL, y = "Partial effect (cm3 cm-2 h-1)",
+         title    = paste0("Partial dependence with thresholds - ", ecosystem_name),
+         subtitle = "Red = zero crossing | Blue = max change | Orange = breakpoint") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text       = element_text(face = "bold"))
+  print(p_thresh)
+
+  print(thresholds)
+
+  # Return everything for later reuse (comparison, tables, saving, etc.)
+  list(
+    ecosystem     = ecosystem_name,
+    rf_model_full = rf_model_full,
+    cv_metrics    = cv_metrics,
+    cv_preds      = cv_preds,
+    r2_cv_mean    = r2_cv_mean,
+    r2_cv_sd      = r2_cv_sd,
+    rmse_cv       = rmse_cv,
+    imp_df        = imp_df,
+    pd_df         = pd_df,
+    thresholds    = thresholds,
+    p_combined    = p_combined,
+    p_pdp         = p_pdp,
+    p_thresh      = p_thresh
+  )
+}
+
+# --- Run for both ecosystems -------------------------------------------
+rf_LE <- run_rf_pipeline_temporal(sf_model_dat2, "LE")
+rf_CB <- run_rf_pipeline_temporal(sf_model_dat2, "CB")
+
+library(kableExtra)
+
+cv_report <- bind_rows(
+  rf_LE$cv_metrics %>% mutate(Ecosystem = "LE"),
+  rf_CB$cv_metrics %>% mutate(Ecosystem = "CB")
+) %>%
+  select(Ecosystem, Year, n_test, r2, rmse) %>%
+  rename(
+    `Held-out Year` = Year,
+    `N (test)`      = n_test,
+    `R2`            = r2,
+    `RMSE`          = rmse
+  ) %>%
+  mutate(
+    R2   = round(R2, 3),
+    RMSE = round(RMSE, 3)
+  )
+
+summary_report <- data.frame(
+  Ecosystem   = c("LE", "CB"),
+  `Mean R2`   = c(rf_LE$r2_cv_mean, rf_CB$r2_cv_mean),
+  `SD R2`     = c(rf_LE$r2_cv_sd,   rf_CB$r2_cv_sd),
+  `Pooled RMSE` = c(rf_LE$rmse_cv, rf_CB$rmse_cv),
+  check.names = FALSE
+)
+
+# Table 1: per-year breakdown
+kable(cv_report, escape = TRUE, booktabs = TRUE,
+      caption = "Leave-one-year-out cross-validation results by ecosystem and held-out year.") %>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  pack_rows(index = table(cv_report$Ecosystem))
+
+# Table 2: summary across years
+kable(summary_report, escape = TRUE, booktabs = TRUE,
+      caption = "Summary of leave-one-year-out cross-validation performance by ecosystem.") %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+#RF without 2022
+```{r}
+# Re-run leave-one-year-out CV excluding the incomplete 2022 season,
+# to get a cleaner estimate of model performance on years with full coverage
+run_rf_pipeline_temporal_excl2022 <- function(data_full, ecosystem_name) {
+  data_filtered <- data_full %>% filter(Year != 2022)
+  run_rf_pipeline_temporal(data_filtered, ecosystem_name)
+}
+
+rf_LE_excl2022 <- run_rf_pipeline_temporal_excl2022(sf_model_dat2, "LE")
+rf_CB_excl2022 <- run_rf_pipeline_temporal_excl2022(sf_model_dat2, "CB")
+
+cat("LE CV R2 (excl. 2022):", rf_LE_excl2022$r2_cv_mean, "±", rf_LE_excl2022$r2_cv_sd, "\n")
+cat("CB CV R2 (excl. 2022):", rf_CB_excl2022$r2_cv_mean, "±", rf_CB_excl2022$r2_cv_sd, "\n")
+```
+
+
+#prep df for differenc between plots
+```{r}
+library(randomForest)
+library(patchwork)
+
+# ── Shared variable names and labels (same as absolute-level RF) ───────────
+env_vars_rf <- c("temp_air", "gw_perc", "vwc", "par", "rain",
+                  "gw_sal", "gw_temp", "gwl", "soil_ec")
+
+var_labels <- c(
+  temp_air  = "Air Temperature",
+  gw_perc   = "GW Saturation",
+  vwc       = "Soil VWC",
+  par       = "PAR",
+  rain      = "Rainfall",
+  gw_sal    = "GW Salinity",
+  gw_temp   = "GW Temperature",
+  gwl       = "GW Level",
+  soil_ec   = "Soil EC"
+)
+
+# ── 0. Apply gw_sal < 50 filter BEFORE computing deltas, so both UP and TR
+# values used in each pair have already passed QC ──────────────────────────
+sf_delta_input <- sf_model_dat2 %>%
+  filter(gw_sal < 20)
+
+# ── 1. Pivot wide so UP and TR are side-by-side per Date x Site ────────────
+delta_wide <- sf_delta_input %>%
+  select(Date, Site, Ecosystem, Season, Year, Plot,
+         F_avg, all_of(env_vars_rf)) %>%
+  pivot_wider(
+    id_cols     = c(Date, Site, Ecosystem, Season, Year),
+    names_from  = Plot,
+    values_from = c(F_avg, all_of(env_vars_rf))
+  )
+
+# ── 2. Compute UP - TR deltas for F_avg and all 9 environmental drivers ────
+delta_raw <- delta_wide %>%
+  filter(!is.na(F_avg_UP) & !is.na(F_avg_TR)) %>%
+  mutate(
+    delta_F        = F_avg_UP     - F_avg_TR,
+    delta_temp_air = temp_air_UP  - temp_air_TR,
+    delta_gw_perc  = gw_perc_UP   - gw_perc_TR,
+    delta_vwc      = vwc_UP       - vwc_TR,
+    delta_par      = par_UP       - par_TR,
+    delta_rain     = rain_UP      - rain_TR,
+    delta_gw_sal   = gw_sal_UP    - gw_sal_TR,
+    delta_gw_temp  = gw_temp_UP   - gw_temp_TR,
+    delta_gwl      = gwl_UP       - gwl_TR,
+    delta_soil_ec  = soil_ec_UP   - soil_ec_TR
+  ) %>%
+  select(Date, Site, Ecosystem, Season, Year,
+         delta_F, delta_temp_air, delta_gw_perc, delta_vwc, delta_par,
+         delta_rain, delta_gw_sal, delta_gw_temp, delta_gwl, delta_soil_ec)
+
+cat("Total daily UP-TR paired observations (gw_sal < 50):", nrow(delta_raw), "\n")
+
+# ── 3. Scale the delta predictors (z-score) ─────────────────────────────────
+delta_scaled <- delta_raw %>%
+  mutate(across(c(delta_temp_air, delta_gw_perc, delta_vwc, delta_par,
+                   delta_rain, delta_gw_sal, delta_gw_temp, delta_soil_ec),
+                ~ scale(.)[, 1],
+                .names = "{.col}_z")) %>%
+  select(delta_F, Ecosystem, Season, Year,
+         #delta_temp_air_z, 
+         delta_gw_perc_z, 
+         delta_vwc_z, 
+         #delta_par_z,
+         #delta_rain_z, 
+         delta_gw_sal_z, 
+         delta_gw_temp_z, 
+         delta_gwl, 
+         delta_soil_ec_z)
+
+str(delta_scaled)
+
+# ── Delta variable labels (matches var_labels, prefixed with delta symbol) ──
+delta_var_labels <- c(
+  delta_temp_air_z = "\u0394 Air Temperature",
+  delta_gw_perc_z  = "\u0394 GW Saturation",
+  delta_vwc_z      = "\u0394 Soil VWC",
+  delta_par_z      = "\u0394 PAR",
+  delta_rain_z     = "\u0394 Rainfall",
+  delta_gw_sal_z   = "\u0394 GW Salinity",
+  delta_gw_temp_z  = "\u0394 GW Temperature",
+  delta_gwl        = "\u0394 GW Level",
+  delta_soil_ec_z  = "\u0394 Soil EC"
+)
+```
+
+#Test for Plot diff with all data
+
+```{r}
+ library(randomForest)
+library(patchwork)
+
+# ── Reusable leave-one-year-out CV pipeline for delta_F models ─────────────
+run_rf_delta_temporal <- function(data_full, ecosystem_name = NULL, point_color = "#2E7D32") {
+
+  label <- if (is.null(ecosystem_name)) "All ecosystems" else ecosystem_name
+  cat("\n\n========== Delta RF:", label, "==========\n")
+
+  # 1. Subset to ecosystem if specified, otherwise use all data
+  rf_dat <- if (is.null(ecosystem_name)) {
+    data_full
+  } else {
+    data_full %>% filter(Ecosystem == ecosystem_name) %>% select(-Ecosystem)
+  }
+
+  rf_dat <- rf_dat %>% na.omit()
+
+  years_available <- sort(unique(rf_dat$Year))
+
+  # 2. Leave-one-year-out cross-validation, pooling out-of-fold predictions
+  cv_list <- lapply(years_available, function(yr) {
+
+    train <- rf_dat %>% filter(Year != yr)
+    test  <- rf_dat %>% filter(Year == yr)
+
+    if (nrow(test) < 10 || nrow(train) < 10) return(NULL)
+
+    m <- randomForest(delta_F ~ ., data = train, ntree = 500,
+                      importance = TRUE, na.action = na.omit)
+    pred <- predict(m, newdata = test)
+
+    r2   <- 1 - sum((test$delta_F - pred)^2) / sum((test$delta_F - mean(test$delta_F))^2)
+    rmse <- sqrt(mean((test$delta_F - pred)^2))
+
+    list(
+      metrics = data.frame(Year = yr, r2 = r2, rmse = rmse, n_test = nrow(test)),
+      preds   = data.frame(Year = yr, observed = test$delta_F, predicted = pred),
+      model   = m
+    )
+  })
+  cv_list <- Filter(Negate(is.null), cv_list)
+
+  cv_metrics <- bind_rows(lapply(cv_list, `[[`, "metrics"))
+  cv_preds   <- bind_rows(lapply(cv_list, `[[`, "preds"))
+
+  r2_cv_mean <- round(mean(cv_metrics$r2), 4)
+  r2_cv_sd   <- round(sd(cv_metrics$r2), 4)
+  rmse_cv    <- round(sqrt(mean((cv_preds$observed - cv_preds$predicted)^2)), 4)
+
+  cat("\n=== Leave-one-year-out CV (", label, ") ===\n")
+  print(cv_metrics)
+  cat("Mean CV R2:", r2_cv_mean, "SD:", r2_cv_sd, "| Pooled RMSE:", rmse_cv, "\n")
+
+  # 3. Observed vs predicted plot using pooled out-of-fold CV predictions
+  lim <- range(c(cv_preds$observed, cv_preds$predicted), na.rm = TRUE)
+
+  p_pred <- ggplot(cv_preds, aes(x = observed, y = predicted, color = factor(Year))) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "grey50", linewidth = 0.8) +
+    geom_point(alpha = 0.3, size = 0.8) +
+    geom_smooth(aes(group = 1), method = "lm", color = "red",
+                se = TRUE, linewidth = 0.8) +
+    annotate("text", x = lim[1] + 0.05 * diff(lim),
+             y = lim[2] - 0.05 * diff(lim),
+             hjust = 0, vjust = 1, size = 3.5,
+             label = paste0(
+               "LOYO-CV R\u00b2 = ", r2_cv_mean, " \u00b1 ", r2_cv_sd, "\n",
+               "Pooled RMSE = ", rmse_cv, " cm\u00b3 cm\u207b\u00b2 h\u207b\u00b9"
+             )) +
+    coord_equal(xlim = lim, ylim = lim) +
+    labs(x = "Observed \u0394F (UP - TR, cm\u00b3 cm\u207b\u00b2 h\u207b\u00b9)",
+         y = "Predicted \u0394F (UP - TR, cm\u00b3 cm\u207b\u00b2 h\u207b\u00b9)",
+         color = "Held-out\nyear",
+         title = paste0("Observed vs predicted (LOYO-CV) - ", label)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  # 4. Final model trained on ALL data (for importance interpretation only —
+  # not for reporting performance, see cv_metrics for that)
+  rf_model_full <- randomForest(delta_F ~ ., data = rf_dat,
+                                ntree = 500, importance = TRUE, na.action = na.omit)
+
+  imp_df <- importance(rf_model_full) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Variable") %>%
+    arrange(desc(`%IncMSE`)) %>%
+    mutate(
+      Variable = recode(Variable,
+        #"delta_temp_air_z" = "\u0394 Air Temperature",
+        "delta_gw_perc_z"  = "\u0394 GW Saturation",
+        "delta_vwc_z"      = "\u0394 Soil VWC",
+        #"delta_par_z"      = "\u0394 PAR",
+        #"delta_rain_z"     = "\u0394 Rainfall",
+        "delta_gw_sal_z"   = "\u0394 GW Salinity",
+        "delta_gw_temp_z"  = "\u0394 GW Temperature",
+        "delta_gwl"        = "\u0394 GW Level",
+        "delta_soil_ec_z"  = "\u0394 Soil EC",
+        "Ecosystem"        = "Ecosystem (LE/CB)",
+        "Season"           = "Season",
+        "Year"             = "Year"
+      ),
+      Variable = factor(Variable, levels = rev(Variable))
+    )
+
+  p_imp <- ggplot(imp_df, aes(x = `%IncMSE`, y = Variable)) +
+    geom_col(fill = point_color, alpha = 0.85, width = 0.7) +
+    geom_text(aes(label = round(`%IncMSE`, 1)), hjust = -0.2, size = 3.2) +
+    labs(x = "% Increase in MSE", y = NULL,
+         title = paste0("Variable importance (full-data model) - ", label)) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank()) +
+    expand_limits(x = max(imp_df$`%IncMSE`) * 1.15)
+
+  # 5. Combine panels
+  p_combined <- p_pred + p_imp +
+    plot_annotation(
+      title    = paste0("Random Forest \u2014 drivers of UP vs TR sap flux difference (\u0394F) - ", label),
+      subtitle = paste0("Leave-one-year-out CV | ntree = 500 | n = ", nrow(rf_dat)),
+      caption  = "Performance reflects prediction on fully held-out years, not a random split.",
+      theme    = theme(plot.title    = element_text(size = 14, face = "bold"),
+                       plot.subtitle = element_text(size = 11),
+                       plot.caption  = element_text(size = 9, color = "grey40"))
+    )
+  print(p_combined)
+
+  list(
+    label         = label,
+    rf_model_full = rf_model_full,
+    cv_metrics    = cv_metrics,
+    cv_preds      = cv_preds,
+    r2_cv_mean    = r2_cv_mean,
+    r2_cv_sd      = r2_cv_sd,
+    rmse_cv       = rmse_cv,
+    imp_df        = imp_df,
+    p_combined    = p_combined,
+    p_pred        = p_pred,
+    p_imp         = p_imp
+  )
+}
+
+# ── 1. Prepare delta data (all 9 environmental drivers - climavue) ────────────────────
+rf_delta_dat <- delta_scaled %>%
+  select(delta_F, Ecosystem, Season, Year,
+         #delta_temp_air_z, 
+         delta_gw_perc_z, 
+         delta_vwc_z, 
+         #delta_par_z,
+         #delta_rain_z, 
+         delta_gw_sal_z, 
+         delta_gw_temp_z, 
+         delta_gwl, 
+         delta_soil_ec_z) %>%
+  na.omit()
+
+cat("Total observations for RF delta model:", nrow(rf_delta_dat), "\n")
+
+# ── 2a. Run combined model (all ecosystems), all years -----------------
+rf_delta_all <- run_rf_delta_temporal(rf_delta_dat)
+
+# ── 2b. Run combined model excluding 2022 (incomplete seasonal coverage) ----
+rf_delta_all_excl2022 <- run_rf_delta_temporal(rf_delta_dat %>% filter(Year != 2022))
+
+cat("\n\nCombined LOYO-CV R2 (all years)    :", rf_delta_all$r2_cv_mean, "\u00b1", rf_delta_all$r2_cv_sd, "\n")
+cat("Combined LOYO-CV R2 (excl. 2022)   :", rf_delta_all_excl2022$r2_cv_mean, "\u00b1", rf_delta_all_excl2022$r2_cv_sd, "\n")
+```
+
+# Test for Plot diff separated by region LE vs CB
+
+```{r}
+
+library(randomForest)
+library(patchwork)
+
+# ── 0. Apply gw_sal < 20 filter BEFORE computing deltas ────────────────────
+# (matches the same threshold used for the absolute-level RF models)
+sf_delta_input <- sf_model_dat2 %>%
+  filter(gw_sal < 20)
+
+# ── 1. Pivot wide — climate variables (temp_air, par, rain) excluded since
+# they come from a single weather station per Site and don't vary by Plot ──
+delta_env_vars <- c("gw_perc", "vwc", "gw_sal", "gw_temp", "gwl", "soil_ec")
+
+delta_wide <- sf_delta_input %>%
+  select(Date, Site, Ecosystem, Season, Year, Plot,
+         F_avg, all_of(delta_env_vars)) %>%
+  pivot_wider(
+    id_cols     = c(Date, Site, Ecosystem, Season, Year),
+    names_from  = Plot,
+    values_from = c(F_avg, all_of(delta_env_vars))
+  )
+
+# ── 2. Compute UP - TR deltas ───────────────────────────────────────────────
+delta_raw <- delta_wide %>%
+  filter(!is.na(F_avg_UP) & !is.na(F_avg_TR)) %>%
+  mutate(
+    delta_F       = F_avg_UP    - F_avg_TR,
+    delta_gw_perc = gw_perc_UP  - gw_perc_TR,
+    delta_vwc     = vwc_UP      - vwc_TR,
+    delta_gw_sal  = gw_sal_UP   - gw_sal_TR,
+    delta_gw_temp = gw_temp_UP  - gw_temp_TR,
+    delta_gwl     = gwl_UP      - gwl_TR,
+    delta_soil_ec = soil_ec_UP  - soil_ec_TR
+  ) %>%
+  select(Date, Site, Ecosystem, Season, Year,
+         delta_F, delta_gw_perc, delta_vwc, delta_gw_sal,
+         delta_gw_temp, delta_gwl, delta_soil_ec)
+
+cat("Total daily UP-TR paired observations (gw_sal < 20):", nrow(delta_raw), "\n")
+
+# ── 3. Scale the delta predictors (z-score) ─────────────────────────────────
+delta_scaled <- delta_raw %>%
+  mutate(across(c(delta_gw_perc, delta_vwc, delta_gw_sal,
+                   delta_gw_temp, delta_soil_ec),
+                ~ scale(.)[, 1],
+                .names = "{.col}_z")) %>%
+  select(Site, delta_F, Ecosystem, Season, Year,
+         delta_gw_perc_z, delta_vwc_z, delta_gw_sal_z,
+         delta_gw_temp_z, delta_gwl, delta_soil_ec_z)
+
+str(delta_scaled)
+
+# ── Delta variable labels ────────────────────────────────────────────────
+delta_var_labels <- c(
+  delta_gw_perc_z = "\u0394 GW Saturation",
+  delta_vwc_z     = "\u0394 Soil VWC",
+  delta_gw_sal_z  = "\u0394 GW Salinity",
+  delta_gw_temp_z = "\u0394 GW Temperature",
+  delta_gwl       = "\u0394 GW Level",
+  delta_soil_ec_z = "\u0394 Soil EC"
+)
+
+# ── Reusable leave-one-year-out CV pipeline for delta_F models ─────────────
+run_rf_delta_temporal <- function(data_full, label, point_color = "#2E7D32") {
+
+  cat("\n\n========== Delta RF:", label, "==========\n")
+
+  rf_dat <- data_full %>% na.omit()
+
+  years_available <- sort(unique(rf_dat$Year))
+
+  cv_list <- lapply(years_available, function(yr) {
+
+    train <- rf_dat %>% filter(Year != yr)
+    test  <- rf_dat %>% filter(Year == yr)
+
+    if (nrow(test) < 10 || nrow(train) < 10) return(NULL)
+
+    m <- randomForest(delta_F ~ ., data = train, ntree = 500,
+                      importance = TRUE, na.action = na.omit)
+    pred <- predict(m, newdata = test)
+
+    r2   <- 1 - sum((test$delta_F - pred)^2) / sum((test$delta_F - mean(test$delta_F))^2)
+    rmse <- sqrt(mean((test$delta_F - pred)^2))
+
+    list(
+      metrics = data.frame(Year = yr, r2 = r2, rmse = rmse, n_test = nrow(test)),
+      preds   = data.frame(Year = yr, observed = test$delta_F, predicted = pred)
+    )
+  })
+  cv_list <- Filter(Negate(is.null), cv_list)
+
+  cv_metrics <- bind_rows(lapply(cv_list, `[[`, "metrics"))
+  cv_preds   <- bind_rows(lapply(cv_list, `[[`, "preds"))
+
+  r2_cv_mean <- round(mean(cv_metrics$r2), 4)
+  r2_cv_sd   <- round(sd(cv_metrics$r2), 4)
+  rmse_cv    <- round(sqrt(mean((cv_preds$observed - cv_preds$predicted)^2)), 4)
+
+  cat("\n=== Leave-one-year-out CV (", label, ") ===\n")
+  print(cv_metrics)
+  cat("Mean CV R2:", r2_cv_mean, "SD:", r2_cv_sd, "| Pooled RMSE:", rmse_cv, "\n")
+
+  lim <- range(c(cv_preds$observed, cv_preds$predicted), na.rm = TRUE)
+
+  p_pred <- ggplot(cv_preds, aes(x = observed, y = predicted, color = factor(Year))) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "grey50", linewidth = 0.8) +
+    geom_point(alpha = 0.3, size = 0.8) +
+    geom_smooth(aes(group = 1), method = "lm", color = "red",
+                se = TRUE, linewidth = 0.8) +
+    annotate("text", x = lim[1] + 0.05 * diff(lim),
+             y = lim[2] - 0.05 * diff(lim),
+             hjust = 0, vjust = 1, size = 3.2,
+             label = paste0(
+               "LOYO-CV R\u00b2 = ", r2_cv_mean, " \u00b1 ", r2_cv_sd, "\n",
+               "Pooled RMSE = ", rmse_cv
+             )) +
+    coord_equal(xlim = lim, ylim = lim) +
+    labs(x = "Observed \u0394F (cm\u00b3 cm\u207b\u00b2 h\u207b\u00b9)",
+         y = "Predicted \u0394F (cm\u00b3 cm\u207b\u00b2 h\u207b\u00b9)",
+         color = "Held-out\nyear",
+         title = paste(label, "\u2014 Obs vs pred (LOYO-CV)")) +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank())
+
+  rf_model_full <- randomForest(delta_F ~ ., data = rf_dat,
+                                ntree = 500, importance = TRUE, na.action = na.omit)
+
+  imp_df <- importance(rf_model_full) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Variable") %>%
+    arrange(desc(`%IncMSE`)) %>%
+    mutate(
+      Variable = recode(Variable, !!!delta_var_labels,
+                         "Season" = "Season", "Year" = "Year"),
+      Variable = factor(Variable, levels = rev(Variable))
+    )
+
+  p_imp <- ggplot(imp_df, aes(x = `%IncMSE`, y = Variable)) +
+    geom_col(fill = point_color, alpha = 0.85, width = 0.7) +
+    geom_text(aes(label = round(`%IncMSE`, 1)), hjust = -0.2, size = 3) +
+    labs(x = "% Increase in MSE", y = NULL,
+         title = paste(label, "\u2014 Variable importance")) +
+    theme_bw(base_size = 11) +
+    theme(panel.grid.minor = element_blank()) +
+    expand_limits(x = max(imp_df$`%IncMSE`) * 1.15)
+
+  list(
+    label      = label,
+    cv_metrics = cv_metrics,
+    cv_preds   = cv_preds,
+    r2_cv_mean = r2_cv_mean,
+    r2_cv_sd   = r2_cv_sd,
+    rmse_cv    = rmse_cv,
+    imp_df     = imp_df,
+    p_pred     = p_pred,
+    p_imp      = p_imp
+  )
+}
+
+# ── 1. Prepare base data (Ecosystem still in for the split) ────────────────
+rf_delta_base <- delta_scaled %>%
+  select(Site, delta_F, Ecosystem, Season, Year,
+         delta_gw_perc_z, delta_vwc_z, delta_gw_sal_z,
+         delta_gw_temp_z, delta_gwl, delta_soil_ec_z) %>%
+  na.omit()
+
+# ── 2a. Split by Ecosystem -------------------------------------------------
+dat_LE <- rf_delta_base %>% filter(Ecosystem == "LE") %>% select(-Ecosystem, -Site)
+dat_CB <- rf_delta_base %>% filter(Ecosystem == "CB") %>% select(-Ecosystem, -Site)
+
+cat("LE n:", nrow(dat_LE), "| CB n:", nrow(dat_CB), "\n")
+
+res_LE <- run_rf_delta_temporal(dat_LE, "LE", "#C62828")
+res_CB <- run_rf_delta_temporal(dat_CB, "CB", "#1565C0")
+
+cat("\nLE delta LOYO-CV R2:", res_LE$r2_cv_mean, "\u00b1", res_LE$r2_cv_sd, "\n")
+cat("CB delta LOYO-CV R2:", res_CB$r2_cv_mean, "\u00b1", res_CB$r2_cv_sd, "\n")
+
+# ── 2b. Combine LE + CB panels (mirrors the absolute-level RF layout) ──────
+(res_LE$p_pred + res_LE$p_imp) /
+(res_CB$p_pred + res_CB$p_imp) +
+  plot_annotation(
+    title    = "Random Forest \u2014 drivers of UP vs TR sap flux difference (\u0394F) by ecosystem",
+    subtitle = "Leave-one-year-out CV | ntree = 500 | gw_sal < 20 filter applied",
+    caption  = paste0(
+      "LE: LOYO-CV R\u00b2 = ", res_LE$r2_cv_mean, " \u00b1 ", res_LE$r2_cv_sd,
+      " | Pooled RMSE = ", res_LE$rmse_cv, "\n",
+      "CB: LOYO-CV R\u00b2 = ", res_CB$r2_cv_mean, " \u00b1 ", res_CB$r2_cv_sd,
+      " | Pooled RMSE = ", res_CB$rmse_cv
+    ),
+    theme = theme(
+      plot.title    = element_text(size = 13, face = "bold"),
+      plot.subtitle = element_text(size = 10),
+      plot.caption  = element_text(size = 9, color = "grey40")
+    )
+  )
+
+# ── 3. Split by Site (for direct comparison with the absolute-level RF,
+# which was also run per Site within each ecosystem) ───────────────────────
+sites_available <- as.character(unique(rf_delta_base$Site))
+
+site_colors <- setNames(
+  scales::hue_pal()(length(sites_available)),
+  sites_available
+)
+
+res_by_site <- lapply(sites_available, function(s) {
+  dat_site <- rf_delta_base %>% filter(as.character(Site) == s) %>% select(-Ecosystem, -Site)
+  if (nrow(na.omit(dat_site)) < 40) {
+    cat("\nSkipping", s, "- insufficient data (n =", nrow(na.omit(dat_site)), ")\n")
+    return(NULL)
+  }
+  run_rf_delta_temporal(dat_site, s, site_colors[[s]])
+})
+names(res_by_site) <- sites_available
+res_by_site <- Filter(Negate(is.null), res_by_site)
+
+# ── 4. Summary table: R2 by Site, comparable to the absolute-level results --
+site_summary <- bind_rows(lapply(res_by_site, function(r) {
+  data.frame(Site = r$label, r2_cv_mean = r$r2_cv_mean, r2_cv_sd = r$r2_cv_sd,
+             rmse_cv = r$rmse_cv)
+}))
+
+print(site_summary)
+
+
+```
+# Plot cComparing variables importance ebtween regions
+
+```{r}
+# ── color palette ──────────────────────────────────────────────────────────────
+var_colors <- c(
+  "Δ GW Salinity"      = "#66C2A5",
+  "Δ Soil VWC"         = "#FC8D62",
+  "Δ Soil Temperature" = "#8DA0CB",
+  "Δ GW Level"         = "#E78AC3",
+  "Δ GW Saturation"    = "#A6D854",
+  "Δ GW Dissolved O2"  = "#FFD92F",
+  "Δ Soil EC"          = "#E5C494",
+  "Season"             = "#B3B3B3",
+  "Year"               = "#1565C0"
+)
+
+# ── plot function ──────────────────────────────────────────────────────────────
+make_imp_plot <- function(imp_df, ecosystem_label) {
+  imp_df %>%
+    mutate(
+      Variable_label = recode(Variable,
+        "delta_gw_sal_z"    = "Δ GW Salinity",
+        "delta_vwc_z"       = "Δ Soil VWC",
+        "delta_soil_temp_z" = "Δ Soil Temperature",
+        "delta_gwl"         = "Δ GW Level",
+        "delta_gw_perc_z"   = "Δ GW Saturation",
+        "delta_gw_rdo_z"    = "Δ GW Dissolved O2",
+        "delta_soil_ec_z"   = "Δ Soil EC",
+        "Season"            = "Season",
+        "Year"              = "Year"
+      ),
+      Variable_label = factor(Variable_label,
+                              levels = Variable_label[order(`%IncMSE`)])
+    ) %>%
+    ggplot(aes(x = `%IncMSE`, y = Variable_label, fill = Variable_label)) +
+    geom_col(width = 0.7, alpha = 0.9, show.legend = FALSE) +
+    geom_text(aes(label = round(`%IncMSE`, 1)), hjust = -0.2, size = 3) +
+    scale_fill_manual(values = var_colors) +
+    expand_limits(x = max(imp_df$`%IncMSE`) * 1.15) +
+    labs(x     = "% Increase in MSE",
+         y     = NULL,
+         title = ecosystem_label) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title       = element_text(face = "bold", size = 12))
+}
+
+# ── generate and combine plots ─────────────────────────────────────────────────
+p_imp_LE <- make_imp_plot(res_LE$imp_df, "Lake Erie (LE)")
+p_imp_CB <- make_imp_plot(res_CB$imp_df, "Chesapeake Bay (CB)")
+
+print(
+  (p_imp_LE + p_imp_CB) +
+    plot_annotation(
+      title    = "Variable importance comparison — LE vs CB",
+      subtitle = paste0("LE R² = ", res_LE$r2_test,
+                        " | CB R² = ", res_CB$r2_test,
+                        " | Each panel ordered by its own importance"),
+      caption  = "Random Forest — 70/30 train/test split | ntree = 500",
+      theme    = theme(plot.title   = element_text(face = "bold"),
+                       plot.caption = element_text(color = "grey40", size = 9))
+    )
+)
+```
+
